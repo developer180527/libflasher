@@ -496,18 +496,38 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("libflasher_watch_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vhd = dir.join("w.vhdx");
-        let diskpart = |cmds: String| {
-            let script = dir.join("dp.txt");
-            std::fs::write(&script, cmds).unwrap();
-            let out = Command::new("diskpart")
-                .arg("/s")
-                .arg(&script)
+        // diskpart only creates the file: a VHD it attaches belongs to its
+        // session and can be detached when diskpart exits. Mount-DiskImage
+        // keeps it attached until Dismount-DiskImage.
+        let script = dir.join("dp.txt");
+        std::fs::write(
+            &script,
+            format!(
+                "create vdisk file=\"{}\" maximum=8 type=expandable\r\n",
+                vhd.display()
+            ),
+        )
+        .unwrap();
+        let out = Command::new("diskpart")
+            .arg("/s")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let powershell = |cmdlet: &str| {
+            let cmd = format!("{cmdlet} -ImagePath '{}' | Out-Null", vhd.display());
+            let out = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
                 .output()
                 .unwrap();
             assert!(
                 out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stdout)
+                "{cmdlet}: {}",
+                String::from_utf8_lossy(&out.stderr)
             );
         };
 
@@ -525,14 +545,11 @@ mod tests {
             }
         };
 
-        let v = vhd.display();
         let before = count.load(Ordering::SeqCst);
-        diskpart(format!(
-            "create vdisk file=\"{v}\" maximum=8 type=expandable\r\nattach vdisk\r\n"
-        ));
+        powershell("Mount-DiskImage");
         wait_for_more(before);
         let before = count.load(Ordering::SeqCst);
-        diskpart(format!("select vdisk file=\"{v}\"\r\ndetach vdisk\r\n"));
+        powershell("Dismount-DiskImage");
         wait_for_more(before);
 
         drop(guard);

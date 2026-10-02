@@ -51,7 +51,7 @@ jobs:
       - name: conformance (as root, as writing a disk requires)
         run: |
           test -n "$FLASHER_TEST_DISK"
-          sudo -E env "PATH=$PATH" cargo test -p libflasher_linux --features test-virtual-disks -- --ignored --nocapture
+          sudo -E env "PATH=$PATH" cargo test -p libflasher_linux --features test-virtual-disks -- --ignored --nocapture --test-threads=1
 
   conformance-macos:
     runs-on: macos-latest
@@ -68,7 +68,7 @@ jobs:
       - name: conformance (as root, so no authopen prompt is needed)
         run: |
           test -n "$FLASHER_TEST_DISK"
-          sudo -E env "PATH=$PATH" cargo test -p libflasher_macos --features test-virtual-disks -- --ignored --nocapture
+          sudo -E env "PATH=$PATH" cargo test -p libflasher_macos --features test-virtual-disks -- --ignored --nocapture --test-threads=1
 
   conformance-windows:
     runs-on: windows-latest
@@ -90,7 +90,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:FLASHER_TEST_DISK) { exit 1 }
-          cargo test -p libflasher_windows --features test-virtual-disks -- --ignored --nocapture
+          cargo test -p libflasher_windows --features test-virtual-disks -- --ignored --nocapture --test-threads=1
 
   docs:
     name: docs and formatting

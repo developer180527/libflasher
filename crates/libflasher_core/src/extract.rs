@@ -82,7 +82,7 @@ impl Source {
                 image.compression.name()
             )));
         }
-        let mut f = BufReader::new(File::open(&image.path)?);
+        let mut f = BufReader::new(image.open_file()?);
         if crate::udf::is_udf(&mut f)? {
             return Udf::open(f).map(Source::Udf).map_err(|e| match e.kind() {
                 io::ErrorKind::Unsupported => Error::Unsupported(e.to_string()),

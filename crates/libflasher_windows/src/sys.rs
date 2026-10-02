@@ -15,7 +15,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
 };
 use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, StorageDeviceProperty, DISK_GEOMETRY_EX, FSCTL_DISMOUNT_VOLUME,
@@ -64,7 +65,7 @@ impl Platform for Windows {
                 model,
                 facts.size,
                 policy::bus_name(facts.bus_type),
-                volumes_on(n)
+                letters_on(n)
                     .into_iter()
                     .map(|l| format!("{l}:\\"))
                     .collect(),
@@ -79,17 +80,16 @@ impl Platform for Windows {
         // the whole write: Windows refuses raw writes over a mounted volume,
         // and would remount it the moment we let go.
         let mut locks = Vec::new();
-        for letter in volumes_on(n) {
-            let path = format!(r"\\.\{letter}:");
+        for path in volumes_on(n) {
             let vol = File::options()
                 .access_mode(GENERIC_READ | GENERIC_WRITE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .open(&path)
                 .map_err(permission)?;
             ioctl(&vol, FSCTL_LOCK_VOLUME, &[], &mut [])
-                .map_err(|e| tool(&format!("locking {letter}:"), e))?;
+                .map_err(|e| tool(&format!("locking volume {path}"), e))?;
             ioctl(&vol, FSCTL_DISMOUNT_VOLUME, &[], &mut [])
-                .map_err(|e| tool(&format!("dismounting {letter}:"), e))?;
+                .map_err(|e| tool(&format!("dismounting volume {path}"), e))?;
             locks.push(vol);
         }
         let file = File::options()
@@ -262,12 +262,41 @@ fn disk_of_volume(path: &str) -> Option<u32> {
     Some(num.DeviceNumber)
 }
 
-/// Drive letters whose volume lives on disk `n`. (A volume spanning disks
-/// reports an error for this query and is left out; it is never removable.)
-fn volumes_on(n: u32) -> Vec<char> {
+/// Drive letters of volumes on disk `n`: what to show as its mount points.
+fn letters_on(n: u32) -> Vec<char> {
     ('A'..='Z')
         .filter(|l| disk_of_volume(&format!(r"\\.\{l}:")) == Some(n))
         .collect()
+}
+
+/// Every mounted volume on disk `n`, as a path to open it by
+/// (`\\?\Volume{…}`) — with a drive letter or without one. Windows refuses
+/// raw writes over any mounted volume, lettered or not, so all of them are
+/// locked. (A volume spanning disks reports an error for the disk-number
+/// query and is left out; it is never removable.)
+fn volumes_on(n: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut name = [0u16; 260];
+    // SAFETY: `name` is valid for its length on every call; the find handle
+    // is closed below.
+    let find = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
+    if find == INVALID_HANDLE_VALUE {
+        return out;
+    }
+    loop {
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        let path = policy::volume_open_path(&String::from_utf16_lossy(&name[..len]));
+        if disk_of_volume(&path) == Some(n) {
+            out.push(path);
+        }
+        // SAFETY: as above.
+        if unsafe { FindNextVolumeW(find, name.as_mut_ptr(), name.len() as u32) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: `find` came from FindFirstVolumeW and is closed once.
+    unsafe { FindVolumeClose(find) };
+    out
 }
 
 /// The disk holding Windows itself, from the Windows directory's drive letter.

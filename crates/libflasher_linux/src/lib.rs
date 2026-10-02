@@ -1,7 +1,8 @@
 //! Linux: sysfs to find disks, `umount2` to release them, `/dev/sdX` to write.
 //!
-//! Writing needs root. Until a polkit helper exists, run the app with `sudo`
-//! or `pkexec`; `open_device` says so rather than failing with EACCES.
+//! Writing needs root. As root, disks are opened directly; otherwise
+//! `libflasher-helper`, started through `pkexec`, opens them and hands the
+//! open file back (see [`helper`]), so the app itself never runs as root.
 //!
 //! Empty on every other OS, so `cargo build --workspace` works everywhere.
 #![cfg(target_os = "linux")]
@@ -46,7 +47,7 @@ impl Platform for Linux {
             .to_string();
             let mountpoints = mounts
                 .iter()
-                .filter(|(d, _)| d.starts_with(&dev))
+                .filter(|(d, _)| system::is_on_disk(d, &dev))
                 .map(|(_, m)| m.clone())
                 .collect();
             let size = read(&sys.join("size")).parse::<u64>().unwrap_or(0) * 512;
@@ -191,7 +192,7 @@ fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
         return Err(Error::Permission("changing a disk needs root".into()));
     }
     for (dev, mountpoint) in mounts() {
-        if dev.starts_with(&device.path) {
+        if system::is_on_disk(&dev, &device.path) {
             let m = CString::new(mountpoint.clone()).map_err(io::Error::other)?;
             if unsafe { libc::umount2(m.as_ptr(), 0) } != 0 {
                 let e = io::Error::last_os_error();

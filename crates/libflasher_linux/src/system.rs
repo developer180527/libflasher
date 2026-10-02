@@ -167,6 +167,23 @@ fn kernel_name(source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the mount source `source` is the disk `disk` or one of its
+/// partitions: `/dev/sda1` is on `/dev/sda`, `/dev/sdaa1` is not;
+/// `/dev/mmcblk0p1` is on `/dev/mmcblk0` (names ending in a digit put a `p`
+/// before the partition number).
+pub(crate) fn is_on_disk(source: &str, disk: &str) -> bool {
+    let Some(rest) = source.strip_prefix(disk) else {
+        return false;
+    };
+    let number = if disk.ends_with(|c: char| c.is_ascii_digit()) {
+        rest.strip_prefix('p')
+    } else {
+        Some(rest)
+    };
+    rest.is_empty()
+        || number.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `(device, mountpoint)` for every line of `/proc/self/mounts`, octal
 /// escapes decoded.
 pub(crate) fn parse_mounts(text: &str) -> Vec<(String, String)> {
@@ -371,6 +388,21 @@ mod tests {
         assert!(s
             .disks(&[("/dev/loop0", "/data"), ("/dev/loop0", "/")], &[], &[])
             .is_empty());
+    }
+
+    #[test]
+    fn partitions_belong_to_their_own_disk_only() {
+        assert!(is_on_disk("/dev/sda", "/dev/sda"));
+        assert!(is_on_disk("/dev/sda1", "/dev/sda"));
+        assert!(is_on_disk("/dev/sda12", "/dev/sda"));
+        assert!(!is_on_disk("/dev/sdaa1", "/dev/sda"));
+        assert!(!is_on_disk("/dev/sdb1", "/dev/sda"));
+        assert!(is_on_disk("/dev/mmcblk0p1", "/dev/mmcblk0"));
+        assert!(!is_on_disk("/dev/mmcblk01", "/dev/mmcblk0"));
+        assert!(!is_on_disk("/dev/mmcblk0boot0", "/dev/mmcblk0"));
+        assert!(is_on_disk("/dev/nvme0n1p3", "/dev/nvme0n1"));
+        assert!(!is_on_disk("/dev/nvme0n10p1", "/dev/nvme0n1"));
+        assert!(!is_on_disk("/dev/sda1x", "/dev/sda"));
     }
 
     #[test]

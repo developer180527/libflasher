@@ -46,6 +46,13 @@ pub fn disk_number(path: &str) -> Option<u32> {
     n.parse().ok()
 }
 
+/// `FindFirstVolumeW` names a volume `\\?\Volume{…}\`; opening it as a
+/// device needs the name without the final backslash (with it, the volume's
+/// root directory is opened instead).
+pub fn volume_open_path(name: &str) -> String {
+    name.strip_suffix('\\').unwrap_or(name).to_string()
+}
+
 pub fn disk_path(number: u32) -> String {
     format!(r"\\.\PhysicalDrive{number}")
 }
@@ -138,6 +145,13 @@ mod tests {
         ] {
             assert_eq!(disk_number(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn volume_names_open_the_volume_not_its_root() {
+        let guid = r"\\?\Volume{3f2504e0-4f89-11d3-9a0c-0305e82c3301}";
+        assert_eq!(volume_open_path(&format!("{guid}\\")), guid);
+        assert_eq!(volume_open_path(guid), guid);
     }
 
     #[test]

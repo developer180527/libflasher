@@ -56,9 +56,10 @@ pub enum ImageKind {
     /// An ISO 9660 filesystem that is *also* a disk image (isohybrid): most
     /// Linux distributions. Written byte for byte.
     HybridIso,
-    /// An ISO 9660 filesystem with no partition table: Windows install media
-    /// and some older ISOs. Booting it from USB needs "extract" mode — a new
-    /// partition table, a filesystem and a bootloader — which is not built yet.
+    /// An ISO 9660 (or UDF) filesystem with no partition table: Windows
+    /// install media and some older ISOs. Written by extract mode
+    /// ([`crate::extract`]): a new GPT and FAT32 partition, with the ISO's
+    /// files copied onto it.
     PlainIso,
     /// No partition table and no ISO header. May still be valid (a bare
     /// filesystem image); written byte for byte, with a warning.
@@ -119,6 +120,10 @@ pub struct ImageInfo {
     /// Size once decompressed, when it is known exactly without decompressing
     /// (uncompressed and `.xz` images). `None` means unknown, not zero.
     pub disk_size: Option<u64>,
+    /// When the file was last modified, as [`inspect`] saw it (`None` where
+    /// the OS does not say). With `file_size`, how [`ImageInfo::open_file`]
+    /// tells that the file changed since.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// Bytes the decompressed image needs to look at to classify it: past the ISO
@@ -131,7 +136,9 @@ const HEAD: usize = 64 * 1024;
 pub fn inspect(path: impl AsRef<Path>) -> Result<ImageInfo> {
     let path = path.as_ref().to_path_buf();
     let mut file = File::open(&path)?;
-    let file_size = file.metadata()?.len();
+    let meta = file.metadata()?;
+    let file_size = meta.len();
+    let modified = meta.modified().ok();
 
     let mut magic = [0u8; 8];
     let n = read_full(&mut file, &mut magic)?;
@@ -156,6 +163,7 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ImageInfo> {
         kind: ImageKind::classify(&head),
         file_size,
         disk_size,
+        modified,
     })
 }
 
@@ -170,11 +178,26 @@ pub struct ImageReader {
 }
 
 impl ImageInfo {
+    /// Open the image file — but only if it is still the file [`inspect`]
+    /// looked at (same size and modification time), so a checksum checked
+    /// and an image written are the same bytes. Fails with
+    /// [`Error::ImageChanged`](crate::Error::ImageChanged) otherwise.
+    pub fn open_file(&self) -> Result<File> {
+        let file = File::open(&self.path)?;
+        let meta = file.metadata()?;
+        if meta.len() != self.file_size || meta.modified().ok() != self.modified {
+            return Err(crate::Error::ImageChanged {
+                path: self.path.display().to_string(),
+            });
+        }
+        Ok(file)
+    }
+
     /// Open the image for reading its decompressed bytes from the start.
     pub fn open(&self) -> Result<ImageReader> {
         let consumed = Arc::new(AtomicU64::new(0));
         let file = Counting {
-            inner: File::open(&self.path)?,
+            inner: self.open_file()?,
             count: consumed.clone(),
         };
         Ok(ImageReader {
@@ -235,6 +258,7 @@ pub(crate) fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn iso_head(mbr: bool) -> Vec<u8> {
         let mut h = vec![0u8; HEAD];
@@ -262,6 +286,49 @@ mod tests {
             ImageKind::PlainIso,
             "UDF-only image"
         );
+    }
+
+    #[test]
+    fn refuses_an_image_that_changed_after_inspecting() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, SystemTime};
+
+        let path =
+            std::env::temp_dir().join(format!("libflasher_changed_{}.img", std::process::id()));
+        std::fs::write(&path, iso_head(true)).unwrap();
+        let info = inspect(&path).unwrap();
+        assert!(info.open().is_ok(), "unchanged: opens");
+
+        // Rewritten in place, same size: only the modification time moves.
+        let f = File::options().write(true).open(&path).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        drop(f);
+        assert!(
+            matches!(info.open(), Err(crate::Error::ImageChanged { .. })),
+            "same size, newer"
+        );
+
+        // Grown (a download still arriving): the size moves.
+        let info = inspect(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"more")
+            .unwrap();
+        assert!(matches!(
+            info.open_file(),
+            Err(crate::Error::ImageChanged { .. })
+        ));
+        let hash = "0".repeat(64);
+        let checked =
+            crate::checksum::verify_image(&info, &hash, &AtomicBool::new(false), &mut |_| {});
+        assert!(
+            matches!(checked, Err(crate::Error::ImageChanged { .. })),
+            "{checked:?}"
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

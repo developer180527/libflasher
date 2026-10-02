@@ -146,6 +146,7 @@ pub fn flash(
     let mut reader = src.reader;
     let mut buf = vec![0u8; CHUNK];
     let mut written = 0u64;
+    let mut since_sync = 0u64;
     device.seek(SeekFrom::Start(0))?;
 
     loop {
@@ -169,8 +170,12 @@ pub fn flash(
             Ok(device.write_all(&buf[..padded])?)
         })?;
         written += n as u64;
-        if written.is_multiple_of(options.sync_every.max(CHUNK as u64)) {
+        // Counted, not `written % sync_every`: that would never hold for an
+        // interval that is not a whole number of chunks.
+        since_sync += n as u64;
+        if since_sync >= options.sync_every.max(CHUNK as u64) {
             timed(options.stall_timeout, written, || device.sync())?;
+            since_sync = 0;
         }
 
         let fraction = match image.disk_size {
@@ -472,6 +477,23 @@ mod tests {
         flash(&info, &mut dev, &opts, &AtomicBool::new(false), &mut |_| {}).unwrap();
         // 8 whole chunks → 4 periodic flushes, plus the final one.
         assert_eq!(dev.syncs, 5);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn flushes_at_intervals_that_are_not_whole_chunks() {
+        let data: Vec<u8> = (0..CHUNK * 8).map(|i| (i % 251) as u8).collect();
+        let path = temp("uneven.img", &data);
+        let info = image::inspect(&path).unwrap();
+        let mut dev = instrumented(CHUNK * 12, None);
+        let opts = FlashOptions {
+            verify: false,
+            sync_every: 3 * CHUNK as u64 + 1,
+            ..FlashOptions::default()
+        };
+        flash(&info, &mut dev, &opts, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        // Past 3 MiB + 1 after chunks 4 and 8, plus the final flush.
+        assert_eq!(dev.syncs, 3);
         std::fs::remove_file(path).ok();
     }
 

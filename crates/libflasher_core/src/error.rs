@@ -77,6 +77,14 @@ pub enum Error {
         actual: String,
     },
 
+    /// The image file changed after it was inspected (re-downloaded, still
+    /// downloading, edited): what would be written is not what was checked.
+    #[error("{path} changed after it was chosen (is it still downloading?); choose it again")]
+    ImageChanged {
+        /// The image file.
+        path: String,
+    },
+
     /// The cancel flag was set, or the user said no at a confirmation.
     #[error("cancelled")]
     Cancelled,

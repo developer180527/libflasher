@@ -1,10 +1,8 @@
 //! macOS: `diskutil` to find and release disks, `authopen` to get a writable
 //! file descriptor without running the whole app as root.
 //!
-//! `diskutil` is the supported command-line face of DiskArbitration. Moving to
-//! the DiskArbitration framework directly would add hot-plug notifications;
-//! nothing else here would change.
-
+//! `diskutil` is the supported command-line face of DiskArbitration; the
+//! framework itself is used only for hot-plug notifications (`watch.rs`).
 //!
 //! Empty on every other OS, so `cargo build --workspace` works everywhere.
 #![cfg(target_os = "macos")]

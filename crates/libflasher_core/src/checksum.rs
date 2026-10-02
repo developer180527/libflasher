@@ -40,7 +40,11 @@ pub fn verify_image(
             actual: "(not a SHA-256: need 64 hex digits)".into(),
         });
     };
-    let actual = sha256_file(&image.path, image.file_size, cancel, progress)?;
+    // Through `open_file`, so these are the bytes `inspect` saw and a write
+    // that follows (which opens it the same way) will see.
+    let actual = sha256_reader(image.open_file()?, image.file_size, cancel, progress)?;
+    // A file still being written to can change while it is hashed.
+    image.open_file()?;
     if actual != expected {
         return Err(Error::ChecksumMismatch { expected, actual });
     }
@@ -54,7 +58,15 @@ pub fn sha256_file(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<String> {
-    let mut f = File::open(path)?;
+    sha256_reader(File::open(path)?, total, cancel, progress)
+}
+
+fn sha256_reader(
+    mut f: impl Read,
+    total: u64,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut done = 0u64;

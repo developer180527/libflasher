@@ -11,6 +11,8 @@ description = "OS-independent core: image detection, decompression, the write/ve
 [dependencies]
 thiserror.workspace = true
 sha2 = "0.10"
+fatfs = "0.3"
+crc32fast = "1"
 flate2 = { version = "1", optional = true }
 xz2 = { version = "0.1", optional = true }
 zstd = { version = "0.13", optional = true }

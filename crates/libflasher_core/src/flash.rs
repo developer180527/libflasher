@@ -103,6 +103,15 @@ pub enum Progress {
         /// Bytes to compare.
         total: u64,
     },
+    /// Extract mode: writing the partition table and formatting FAT32.
+    Formatting,
+    /// Extract mode: copying the ISO's files onto the drive.
+    Copying {
+        /// Bytes of file data copied so far.
+        done: u64,
+        /// Bytes of file data in the ISO.
+        total: u64,
+    },
     /// Hashing the image file to compare with its published checksum,
     /// before anything touches the drive. Bytes of the file, not the disk.
     Checking {
@@ -264,6 +273,23 @@ fn verify(
         });
     }
     Ok(verified)
+}
+
+/// Put `image` on `device` the way it needs: written byte for byte if it is
+/// a disk image or hybrid ISO, extracted onto FAT32 if it is an ISO that is
+/// not ([`crate::extract`]). Returns the bytes written or copied.
+pub fn write_image(
+    image: &ImageInfo,
+    device: &mut dyn RawDevice,
+    options: &FlashOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<u64> {
+    if image.kind.needs_extract() {
+        crate::extract::extract(image, device, options, cancel, progress)
+    } else {
+        flash(image, device, options, cancel, progress)
+    }
 }
 
 #[cfg(test)]

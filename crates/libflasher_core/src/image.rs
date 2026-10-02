@@ -83,12 +83,17 @@ impl ImageKind {
         !matches!(self, Self::PlainIso)
     }
 
+    /// Whether it goes on a drive by extract mode rather than byte for byte.
+    pub fn needs_extract(self) -> bool {
+        matches!(self, Self::PlainIso)
+    }
+
     /// A short description for people.
     pub fn describe(self) -> &'static str {
         match self {
             Self::RawDisk => "disk image",
             Self::HybridIso => "hybrid ISO (bootable as written)",
-            Self::PlainIso => "non-hybrid ISO (needs extract mode, e.g. Windows installers)",
+            Self::PlainIso => "ISO (its files are copied onto a FAT32 drive)",
             Self::Unknown => "no partition table found",
         }
     }

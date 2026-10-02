@@ -405,4 +405,113 @@ mod tests {
         drop(guard);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// Extract mode, judged by tools that are not ours: `hdiutil makehybrid`
+    /// builds the ISO (Joliet names), libflasher extracts it into a disk
+    /// image file, and macOS's own GPT and FAT32 code mounts the result.
+    /// Needs no root and touches no real drive.
+    #[test]
+    fn macos_mounts_what_extract_mode_writes() {
+        use libflasher_core::{extract, image, mock::FileDevice, FlashOptions};
+        use std::sync::atomic::AtomicBool;
+
+        let dir =
+            std::env::temp_dir().join(format!("libflasher_extract_mac_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("EFI/BOOT/BOOTX64.EFI", vec![0x4D; 40_000]),
+            ("boot/grub/grub.cfg", b"set timeout=5\n".to_vec()),
+            (
+                "Long File Name With Spaces.txt",
+                b"joliet keeps this".to_vec(),
+            ),
+            (
+                "live/filesystem.squashfs",
+                (0..2_000_000u32).map(|i| (i % 249) as u8).collect(),
+            ),
+        ];
+        for (p, data) in &files {
+            let path = src.join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        }
+        let iso = dir.join("test.iso");
+        let out = Command::new("hdiutil")
+            .args([
+                "makehybrid",
+                "-iso",
+                "-joliet",
+                "-default-volume-name",
+                "FLASHTEST",
+                "-o",
+            ])
+            .arg(&iso)
+            .arg(&src)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "makehybrid: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let disk = dir.join("disk.img");
+        std::fs::write(&disk, vec![0u8; 96 << 20]).unwrap();
+        let info = image::inspect(&iso).unwrap();
+        assert!(info.kind.needs_extract(), "{:?}", info.kind);
+        let mut dev = FileDevice::open(&disk).unwrap();
+        extract::extract(
+            &info,
+            &mut dev,
+            &FlashOptions::default(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        drop(dev);
+
+        let mnt = dir.join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        let out = Command::new("hdiutil")
+            .args([
+                "attach",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                "-mountroot",
+            ])
+            .arg(&mnt)
+            .arg(&disk)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "attach: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let whole = text.split_whitespace().next().unwrap().to_string();
+        let volume = text
+            .lines()
+            .find_map(|l| {
+                l.split('\t')
+                    .map(str::trim)
+                    .find(|f| f.starts_with('/') && f.contains("mnt"))
+            })
+            .map(std::path::PathBuf::from);
+
+        let result = std::panic::catch_unwind(|| {
+            let volume =
+                volume.expect("macOS mounted no volume: it did not accept the GPT or the FAT32");
+            for (p, data) in &files {
+                let got = std::fs::read(volume.join(p)).unwrap_or_else(|e| panic!("{p}: {e}"));
+                assert!(got == *data, "{p} differs");
+            }
+        });
+        let _ = Command::new("hdiutil").args(["detach", &whole]).output();
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 }

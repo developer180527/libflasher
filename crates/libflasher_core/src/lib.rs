@@ -8,17 +8,21 @@
 
 #![warn(missing_docs)]
 
+mod blockio;
 pub mod checksum;
 pub mod conformance;
 mod error;
+pub mod extract;
 mod flash;
+mod gpt;
 pub mod image;
+pub mod iso9660;
 pub mod mock;
 pub mod platform;
 pub mod rate;
 mod xz_size;
 
 pub use error::{Error, Result};
-pub use flash::{flash, verify_device, FlashOptions, Progress};
+pub use flash::{flash, verify_device, write_image, FlashOptions, Progress};
 pub use image::{Compression, ImageInfo, ImageKind};
 pub use platform::{DeviceInfo, OnChange, Platform, RawDevice};

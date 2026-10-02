@@ -124,6 +124,8 @@ impl StatusLine {
                 | (Some(Syncing), Syncing)
                 | (Some(Verifying { .. }), Verifying { .. })
                 | (Some(Checking { .. }), Checking { .. })
+                | (Some(Copying { .. }), Copying { .. })
+                | (Some(Formatting), Formatting)
         );
         if !same_phase {
             self.phase_started = Instant::now();
@@ -144,7 +146,8 @@ impl StatusLine {
             } => self.meter.record((fraction as f64 * FRACTION_SCALE) as u64),
             Verifying { verified, .. } => self.meter.record(verified),
             Checking { done, .. } => self.meter.record(done),
-            Syncing => {}
+            Copying { done, .. } => self.meter.record(done),
+            Syncing | Formatting => {}
         }
         self.last = Some(p);
     }
@@ -160,7 +163,10 @@ impl StatusLine {
             crate::Progress::Checking { done, total } => {
                 Some((done as f64 / total.max(1) as f64) as f32)
             }
-            crate::Progress::Syncing => None,
+            crate::Progress::Copying { done, total } => {
+                Some((done as f64 / total.max(1) as f64) as f32)
+            }
+            crate::Progress::Syncing | crate::Progress::Formatting => None,
         }
     }
 
@@ -204,6 +210,16 @@ impl StatusLine {
                     self.left(self.meter.remaining(FRACTION_SCALE as u64), true)
                 )
             }
+            Some(crate::Progress::Formatting) => {
+                "Partitioning and formatting the drive (FAT32)…".into()
+            }
+            Some(crate::Progress::Copying { done, total }) => format!(
+                "Copying files {} of {}{}{}",
+                size(done),
+                size(total),
+                speed(self.meter.rate()),
+                self.left(self.meter.remaining(total), false)
+            ),
             Some(crate::Progress::Syncing) => {
                 format!(
                     "Flushing to the drive… {}",

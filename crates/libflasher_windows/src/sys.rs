@@ -119,6 +119,11 @@ impl Platform for Windows {
         Ok(())
     }
 
+    fn watch(&self, on_change: libflasher_core::OnChange) -> Option<Box<dyn std::any::Any + Send>> {
+        crate::watch::Watcher::start(on_change)
+            .map(|w| Box::new(w) as Box<dyn std::any::Any + Send>)
+    }
+
     fn keep_awake(&self, reason: &str) -> Option<Box<dyn std::any::Any + Send>> {
         PowerRequest::new(reason).map(|r| Box::new(r) as Box<dyn std::any::Any + Send>)
     }
@@ -479,6 +484,61 @@ mod tests {
 
     /// See `libflasher_core::conformance`: runs in CI (elevated) against a
     /// VHD named in `FLASHER_TEST_DISK`.
+    /// Attaching a VHD is a disk arrival. Needs an elevated process for
+    /// `diskpart`, so it runs in CI's conformance job.
+    #[test]
+    #[ignore = "needs administrator rights to attach a VHD"]
+    fn watch_notices_a_vhd_being_attached_and_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("libflasher_watch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vhd = dir.join("w.vhdx");
+        let diskpart = |cmds: String| {
+            let script = dir.join("dp.txt");
+            std::fs::write(&script, cmds).unwrap();
+            let out = Command::new("diskpart")
+                .arg("/s")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        };
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let guard = Windows.watch(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(guard.is_some(), "CM_Register_Notification should work");
+        let wait_for_more = |than: usize| {
+            let end = Instant::now() + Duration::from_secs(15);
+            while count.load(Ordering::SeqCst) <= than {
+                assert!(Instant::now() < end, "no notification within 15 s");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let v = vhd.display();
+        let before = count.load(Ordering::SeqCst);
+        diskpart(format!(
+            "create vdisk file=\"{v}\" maximum=8 type=expandable\r\nattach vdisk\r\n"
+        ));
+        wait_for_more(before);
+        let before = count.load(Ordering::SeqCst);
+        diskpart(format!("select vdisk file=\"{v}\"\r\ndetach vdisk\r\n"));
+        wait_for_more(before);
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     #[ignore = "writes to the disk named in FLASHER_TEST_DISK"]
     #[cfg(feature = "test-virtual-disks")]

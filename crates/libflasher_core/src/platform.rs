@@ -4,6 +4,9 @@ use std::io::{Read, Seek, Write};
 
 use crate::{Error, Result};
 
+/// What [`Platform::watch`] calls when the set of disks may have changed.
+pub type OnChange = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// A whole physical disk the user could write an image to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -92,6 +95,18 @@ pub trait Platform: Send + Sync {
 
     /// Release the disk so the user can pull it out.
     fn eject(&self, device: &DeviceInfo) -> Result<()>;
+
+    /// Call `on_change` whenever a disk is attached or removed, until the
+    /// returned guard is dropped. It runs on a thread of the platform's, may
+    /// fire for disks that are not candidates (partitions, internal disks)
+    /// and may fire several times for one plug-in: treat it as "list again",
+    /// not as a description of what changed.
+    ///
+    /// `None` where the OS offers no notifications or they could not be set
+    /// up; poll [`Platform::list_devices`] instead.
+    fn watch(&self, _on_change: OnChange) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
 
     /// Keep the computer from sleeping until the returned guard is dropped.
     /// `None` where the OS offers no way, or it failed: the caller carries on,

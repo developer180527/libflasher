@@ -6,6 +6,8 @@
 //! Empty on every other OS, so `cargo build --workspace` works everywhere.
 #![cfg(target_os = "linux")]
 
+mod watch;
+
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -79,6 +81,11 @@ impl Platform for Linux {
         // Everything is synced by now; powering the port off is UDisks2's job
         // (`udisksctl power-off`), and not worth a D-Bus dependency yet.
         Ok(())
+    }
+
+    /// Kernel uevents for the block subsystem, on a thread of their own.
+    fn watch(&self, on_change: libflasher_core::OnChange) -> Option<Box<dyn std::any::Any + Send>> {
+        watch::Watcher::start(on_change).map(|w| Box::new(w) as Box<dyn std::any::Any + Send>)
     }
 
     /// systemd's sleep inhibitor, held by a child that sleeps until killed.
@@ -300,6 +307,59 @@ fn program_name() -> String {
 mod tests {
     /// See `libflasher_core::conformance`: runs in CI as root, against a
     /// loop device named in `FLASHER_TEST_DISK`.
+    /// Attaching a loop device is a block "add" uevent. Needs root for
+    /// `losetup`, so it runs in CI's conformance job.
+    #[test]
+    #[ignore = "needs root to attach a loop device"]
+    fn watch_notices_a_loop_device_being_attached_and_removed() {
+        use libflasher_core::Platform;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let img = std::env::temp_dir().join(format!("libflasher_watch_{}.img", std::process::id()));
+        std::fs::write(&img, vec![0u8; 1 << 20]).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let guard = super::Linux.watch(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(guard.is_some(), "uevent socket should open");
+        let wait_for_more = |than: usize| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while count.load(Ordering::SeqCst) <= than {
+                assert!(Instant::now() < end, "no notification within 10 s");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let before = count.load(Ordering::SeqCst);
+        let out = Command::new("losetup")
+            .args(["--find", "--show"])
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        wait_for_more(before);
+
+        let before = count.load(Ordering::SeqCst);
+        assert!(Command::new("losetup")
+            .args(["-d", &dev])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_more(before);
+
+        drop(guard);
+        let _ = std::fs::remove_file(img);
+    }
+
     #[test]
     #[ignore = "writes to the disk named in FLASHER_TEST_DISK"]
     #[cfg(feature = "test-virtual-disks")]

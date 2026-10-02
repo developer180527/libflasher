@@ -21,4 +21,4 @@ mod xz_size;
 pub use error::{Error, Result};
 pub use flash::{flash, verify_device, FlashOptions, Progress};
 pub use image::{Compression, ImageInfo, ImageKind};
-pub use platform::{DeviceInfo, Platform, RawDevice};
+pub use platform::{DeviceInfo, OnChange, Platform, RawDevice};

@@ -100,6 +100,28 @@ impl Platform for MockPlatform {
         self.file_for(device).map(|_| ())
     }
 
+    /// Polls the directory every 20 ms: mock drives are files, which have no
+    /// plug-in events of their own.
+    fn watch(&self, on_change: crate::platform::OnChange) -> Option<Box<dyn std::any::Any + Send>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (dir, flag) = (self.dir.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let me = MockPlatform::new(dir);
+            let mut last = me.list_devices().ok();
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let now = me.list_devices().ok();
+                if now != last {
+                    on_change();
+                    last = now;
+                }
+            }
+        });
+        Some(Box::new(StopOnDrop(stop)))
+    }
+
     /// Held for as long as the computer must stay awake; while it is, the
     /// file `.awake` exists in the mock directory and holds the reason.
     fn keep_awake(&self, reason: &str) -> Option<Box<dyn std::any::Any + Send>> {
@@ -238,5 +260,13 @@ impl RawDevice for FileDevice {
     fn sync(&mut self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
+    }
+}
+
+struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

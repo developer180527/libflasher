@@ -18,6 +18,7 @@ use libflasher_core::{DeviceInfo, Error, Platform, RawDevice, Result};
 use plist::{Dictionary, Value};
 
 mod authopen;
+mod watch;
 
 pub struct MacOs;
 
@@ -87,6 +88,11 @@ impl Platform for MacOs {
     fn eject(&self, device: &DeviceInfo) -> Result<()> {
         whole_disk_id(&device.path)?;
         run("diskutil", &["eject", &device.path]).map(|_| ())
+    }
+
+    /// DiskArbitration callbacks, on a thread of their own.
+    fn watch(&self, on_change: libflasher_core::OnChange) -> Option<Box<dyn std::any::Any + Send>> {
+        watch::Watcher::start(on_change).map(|w| Box::new(w) as Box<dyn std::any::Any + Send>)
     }
 
     /// `caffeinate` is Apple's own tool for this. `-i` holds off idle sleep
@@ -325,5 +331,78 @@ mod tests {
         if let Some(path) = libflasher_core::conformance::test_disk() {
             libflasher_core::conformance::full_cycle(&MacOs, &path);
         }
+    }
+
+    /// Attaching a disk image is a plug-in as far as DiskArbitration is
+    /// concerned, and needs no root: this runs everywhere, CI included.
+    #[test]
+    fn watch_notices_a_disk_being_attached_and_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("libflasher_watch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("w.dmg");
+        let ok = Command::new("hdiutil")
+            .args(["create", "-size", "1m", "-layout", "NONE", "-type", "UDIF"])
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let guard = MacOs.watch(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(guard.is_some(), "DiskArbitration session should start");
+        // Registering reports the disks already present; let that settle.
+        std::thread::sleep(Duration::from_millis(500));
+        let wait_for_more = |than: usize| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while count.load(Ordering::SeqCst) <= than {
+                assert!(Instant::now() < end, "no notification within 10 s");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let before = count.load(Ordering::SeqCst);
+        let out = Command::new("hdiutil")
+            .args(["attach", "-nomount"])
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dev = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        wait_for_more(before);
+
+        let before = count.load(Ordering::SeqCst);
+        let out = Command::new("hdiutil")
+            .args(["detach", &dev])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        wait_for_more(before);
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -18,6 +18,8 @@ pub mod policy;
 
 #[cfg(windows)]
 mod sys;
+#[cfg(windows)]
+mod watch;
 
 #[cfg(windows)]
 pub use sys::Windows;

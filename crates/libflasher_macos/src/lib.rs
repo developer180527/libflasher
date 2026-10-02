@@ -32,6 +32,8 @@ impl Platform for MacOs {
         // CI's throwaway disk image is "external, virtual": add just that one.
         #[cfg(feature = "test-virtual-disks")]
         let list = with_test_disk(list)?;
+        // A Mac started from an external drive lists it as external.
+        let system = system_disks()?;
         let mut out = Vec::new();
         for entry in array(&list, "AllDisksAndPartitions") {
             let Some(d) = entry.as_dictionary() else {
@@ -40,6 +42,9 @@ impl Platform for MacOs {
             let Some(id) = string(d, "DeviceIdentifier") else {
                 continue;
             };
+            if system.contains(&id) {
+                continue;
+            }
             let info = disk_info(&id)?;
             if bool(&info, "Internal") {
                 continue;
@@ -158,7 +163,69 @@ fn external_whole_disk(device: &DeviceInfo) -> Result<(&str, Dictionary)> {
             reason: "not an external whole disk".into(),
         });
     }
+    if system_disks()?.iter().any(|d| d == id) {
+        return Err(Error::Refused {
+            device: device.path.clone(),
+            reason: "macOS is running from this disk".into(),
+        });
+    }
     Ok((id, info))
+}
+
+/// The physical whole disks the running macOS is on: those holding the
+/// APFS container of `/` (the system volume) and of the data volume, or,
+/// for a volume that is not APFS, its own disk.
+fn system_disks() -> Result<Vec<String>> {
+    let mut out = whole_disks_under(&diskutil_info_of("/")?);
+    // Absent before macOS 10.15, when / held everything.
+    if let Ok(data) = diskutil_info_of("/System/Volumes/Data") {
+        out.extend(whole_disks_under(&data));
+    }
+    if out.is_empty() {
+        return Err(tool_err(
+            "diskutil",
+            "could not tell which disk macOS is running from",
+        ));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn diskutil_info_of(path: &str) -> Result<Dictionary> {
+    match diskutil_plist(&["info", "-plist", path])? {
+        Value::Dictionary(d) => Ok(d),
+        _ => Err(tool_err("diskutil", "unexpected output")),
+    }
+}
+
+/// From `diskutil info` of a volume: the whole disks under it. An APFS
+/// volume's `ParentWholeDisk` is its synthesized container disk, not a
+/// physical one; the physical disks are its `APFSPhysicalStores`.
+fn whole_disks_under(info: &Dictionary) -> Vec<String> {
+    let stores: Vec<String> = info
+        .get("APFSPhysicalStores")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            s.as_dictionary()
+                .and_then(|s| string(s, "APFSPhysicalStore"))
+        })
+        .collect();
+    let parts = if stores.is_empty() {
+        string(info, "ParentWholeDisk").into_iter().collect()
+    } else {
+        stores
+    };
+    parts.iter().filter_map(|p| whole_of(p)).collect()
+}
+
+/// `disk0s2` → `disk0`; `disk4` → `disk4`.
+fn whole_of(id: &str) -> Option<String> {
+    let digits = id.strip_prefix("disk")?;
+    let n: String = digits.chars().take_while(char::is_ascii_digit).collect();
+    (!n.is_empty()).then(|| format!("disk{n}"))
 }
 
 struct KillOnDrop(std::process::Child);
@@ -296,6 +363,58 @@ mod tests {
         assert!(whole_disk_id("/dev/rdisk4").is_err());
         assert!(whole_disk_id("disk4").is_err());
         assert!(whole_disk_id("/dev/disk").is_err());
+    }
+
+    /// What `diskutil info -plist` reports for an APFS system volume, and
+    /// for an HFS+ one.
+    #[test]
+    fn finds_the_physical_disks_under_a_volume() {
+        let apfs = Value::from_reader_xml(
+            br#"<plist version="1.0"><dict>
+                <key>DeviceIdentifier</key><string>disk3s1s1</string>
+                <key>ParentWholeDisk</key><string>disk3</string>
+                <key>APFSPhysicalStores</key><array>
+                    <dict><key>APFSPhysicalStore</key><string>disk4s2</string></dict>
+                    <dict><key>APFSPhysicalStore</key><string>disk12s2</string></dict>
+                </array>
+            </dict></plist>"# as &[u8],
+        )
+        .unwrap();
+        let apfs = apfs.as_dictionary().unwrap();
+        assert_eq!(
+            whole_disks_under(apfs),
+            ["disk4", "disk12"],
+            "not the container disk3"
+        );
+
+        let hfs = Value::from_reader_xml(
+            br#"<plist version="1.0"><dict>
+                <key>DeviceIdentifier</key><string>disk2s2</string>
+                <key>ParentWholeDisk</key><string>disk2</string>
+            </dict></plist>"# as &[u8],
+        )
+        .unwrap();
+        assert_eq!(whole_disks_under(hfs.as_dictionary().unwrap()), ["disk2"]);
+        assert_eq!(whole_of("disk0s2").as_deref(), Some("disk0"));
+        assert_eq!(whole_of("rdisk0"), None);
+    }
+
+    /// On this Mac: the disk it runs from is found, never listed, and
+    /// refused if named, before anything is unmounted or opened.
+    #[test]
+    fn the_running_system_disk_is_found_and_refused() {
+        let system = system_disks().unwrap();
+        assert!(!system.is_empty());
+        let listed = MacOs.list_devices().unwrap();
+        for id in &system {
+            let path = format!("/dev/{id}");
+            assert!(listed.iter().all(|d| d.path != path), "{path} was listed");
+            let device = DeviceInfo::new(path, "", 0, "", vec![]);
+            assert!(
+                matches!(external_whole_disk(&device), Err(Error::Refused { .. })),
+                "{id} was not refused"
+            );
+        }
     }
 
     /// Lists whatever is plugged in; never fails just because nothing is.

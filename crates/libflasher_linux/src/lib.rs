@@ -7,6 +7,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod helper;
+mod system;
 mod watch;
 
 use std::ffi::CString;
@@ -27,15 +28,12 @@ impl Platform for Linux {
 
     fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
         let mounts = mounts();
-        let root_disk = mounts
-            .iter()
-            .find(|(_, m)| m == "/")
-            .and_then(|(dev, _)| disk_of(dev));
+        let system = system::disks()?;
         let mut out = Vec::new();
         for entry in fs::read_dir("/sys/block")? {
             let name = entry?.file_name().to_string_lossy().into_owned();
             let sys = Path::new("/sys/block").join(&name);
-            if Some(&name) == root_disk.as_ref() || !is_candidate(&name, &sys) {
+            if system.contains(&name) || !is_candidate(&name, &sys) {
                 continue;
             }
             let dev = format!("/dev/{name}");
@@ -164,8 +162,9 @@ pub(crate) fn restore_as_root(device: &DeviceInfo, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// The device must be a removable whole disk; returns its kernel name and
-/// sysfs directory. Needs no privileges.
+/// The device must be a removable whole disk that the running system does
+/// not live on; returns its kernel name and sysfs directory. Needs no
+/// privileges.
 fn check(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
     let name = device.path.strip_prefix("/dev/").unwrap_or("");
     let sys = Path::new("/sys/block").join(name);
@@ -173,6 +172,12 @@ fn check(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
         return Err(Error::Refused {
             device: device.path.clone(),
             reason: "not a removable whole disk".into(),
+        });
+    }
+    if system::disks()?.iter().any(|d| d == name) {
+        return Err(Error::Refused {
+            device: device.path.clone(),
+            reason: "the running system is on this disk".into(),
         });
     }
     Ok((name.to_string(), sys))
@@ -259,33 +264,7 @@ fn is_candidate(name: &str, sys: &Path) -> bool {
 
 /// `(device, mountpoint)` for every mount, octal escapes decoded.
 fn mounts() -> Vec<(String, String)> {
-    fs::read_to_string("/proc/self/mounts")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let mut f = l.split(' ');
-            Some((f.next()?.to_string(), unescape(f.next()?)))
-        })
-        .collect()
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
-}
-
-/// `/dev/sda2` → `sda`, `/dev/nvme0n1p2` → `nvme0n1`, via sysfs rather than string rules.
-fn disk_of(dev: &str) -> Option<String> {
-    let part = dev.strip_prefix("/dev/")?;
-    let p = fs::canonicalize(Path::new("/sys/class/block").join(part)).ok()?;
-    let whole = if p.join("partition").exists() {
-        p.parent()?
-    } else {
-        &p
-    };
-    Some(whole.file_name()?.to_string_lossy().into_owned())
+    system::parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
 }
 
 fn read(p: &Path) -> String {

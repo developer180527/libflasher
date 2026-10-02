@@ -45,7 +45,7 @@ file-backed mock drives, so it needs no hardware.
 | Images | Disk image / hybrid ISO / plain ISO detected from content, not name. gzip, xz, zstd, bzip2. An `.xz`'s exact size is read from its index, so progress is exact and a too-small drive is refused before writing. |
 | Filesystems read | ISO 9660 with Rock Ridge and Joliet (continuation areas, split names); UDF 1.02–2.01 (Windows ISOs). |
 | Checksums | SHA-256 of the download, checked before the drive is touched; found automatically in `SHA256SUMS` / `<image>.sha256` next to it. |
-| Safety | Only removable disks are listed; the system disk never is, and is refused if named. A drive is re-checked (model, size, bus) before opening, because device paths are reused after unplugging. |
+| Safety | Only removable disks are listed. The disks the running system is on never are, however they are attached, and are refused if named: macOS follows `/` to its APFS physical stores (a Mac started from an external SSD); Linux follows the system mounts and swap through partitions, LVM/LUKS/RAID and loop devices (a live USB, `/dev/root`). A drive is re-checked (model, size, bus) before opening, because device paths are reused after unplugging. |
 | Faults | 1 MiB requests, a flush every 32 MiB; a request over 20 s is a stall and nothing more is sent; an unplugged drive is reported as such, mid-write or mid-verify. |
 | Progress | Speed and time left over a sliding window, labelled when estimated (`rate::StatusLine`, the same words in every front end). |
 | Platform services | Hot-plug notifications, keep-awake, eject, restore a flashed drive to plain exFAT. |
@@ -120,6 +120,7 @@ Done: everything above. About 7,900 lines; 52 tests and 9 CI jobs, all green.
   not boot, as FAT labels are 11 characters. Those ISOs are hybrid, so they
   take the raw path anyway.
 - Ejecting is a no-op on Linux (needs UDisks2 power-off).
+- A Linux root on a multi-device btrfs or a ZFS pool is traced to one disk at most; such roots on USB disks are rare, and a mounted disk is refused when opened anyway.
 - Not yet on crates.io. The API is frozen at 0.1 but has had no outside users.
 
 ## Licence

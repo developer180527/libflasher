@@ -43,11 +43,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y exfatprogs
       - run: cargo test -p libflasher_linux --features test-virtual-disks --no-run
+      - run: cargo build -p libflasher_linux --features test-virtual-disks --bins
       - name: create a 256 MiB loop device
         run: |
           truncate -s 256M "$RUNNER_TEMP/disk.img"
           dev=$(sudo losetup --find --show --partscan "$RUNNER_TEMP/disk.img")
           echo "FLASHER_TEST_DISK=$dev" >> "$GITHUB_ENV"
+      - name: conformance as an ordinary user, through libflasher-helper
+        # The test runs unprivileged; opening and restoring the disk go
+        # through the helper, with `sudo -n` standing in for pkexec's
+        # password prompt. Before the root run, which leaves root-owned
+        # build files behind.
+        run: |
+          test -n "$FLASHER_TEST_DISK"
+          test "$(id -u)" != 0
+          LIBFLASHER_HELPER=$PWD/target/debug/libflasher-helper LIBFLASHER_ELEVATOR=sudo \
+            cargo test -p libflasher_linux --features test-virtual-disks conformance -- --ignored --nocapture --test-threads=1
       - name: conformance (as root, as writing a disk requires)
         run: |
           test -n "$FLASHER_TEST_DISK"

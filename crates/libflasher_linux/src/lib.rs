@@ -6,6 +6,7 @@
 //! Empty on every other OS, so `cargo build --workspace` works everywhere.
 #![cfg(target_os = "linux")]
 
+pub mod helper;
 mod watch;
 
 use std::ffi::CString;
@@ -62,14 +63,15 @@ impl Platform for Linux {
         Ok(out)
     }
 
+    /// As root, directly; otherwise through `libflasher-helper` (pkexec),
+    /// which opens the disk and hands the open file back.
     fn open_device(&self, device: &DeviceInfo) -> Result<Box<dyn RawDevice>> {
-        let (_, sys) = prepare(device)?;
-        // O_EXCL on a block device fails if anything else still holds it mounted.
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_EXCL)
-            .open(&device.path)?;
+        let (_, sys) = check(device)?;
+        let file = if is_root() {
+            open_as_root(device)?
+        } else {
+            helper::open(&device.path)?
+        };
         let sector = read(&sys.join("queue/logical_block_size"))
             .parse()
             .unwrap_or(512);
@@ -109,33 +111,59 @@ impl Platform for Linux {
     }
 
     /// A GPT with one "Microsoft basic data" partition, formatted exFAT —
-    /// what macOS's and Windows' own "erase" produce. Needs `sfdisk`
-    /// (util-linux) and `mkfs.exfat` (exfatprogs).
+    /// what macOS's and Windows' own "erase" produce. As root directly;
+    /// otherwise through `libflasher-helper`.
     fn restore(&self, device: &DeviceInfo, label: &str) -> Result<()> {
-        let (name, _) = prepare(device)?;
-        run("wipefs", &["--all", &device.path], None)?;
-        run(
-            "sfdisk",
-            &["--quiet", &device.path],
-            Some("label: gpt\n,,EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n"),
-        )?;
-        // Wait for the kernel and udev to create the new partition's node.
-        let _ = run("udevadm", &["settle"], None);
-        // sdb → sdb1; mmcblk0, nvme0n1 (names ending in a digit) → mmcblk0p1.
-        let sep = if name.ends_with(|c: char| c.is_ascii_digit()) {
-            "p"
+        check(device)?;
+        if is_root() {
+            restore_as_root(device, label)
         } else {
-            ""
-        };
-        let part = format!("/dev/{name}{sep}1");
-        run("mkfs.exfat", &["-n", label, &part], None)?;
-        Ok(())
+            helper::restore(&device.path, label)
+        }
     }
 }
 
-/// Checks `device` is a removable whole disk and that we are root, then
-/// unmounts everything on it. Returns its kernel name and sysfs directory.
-fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Open the disk for writing; needs root. Used directly when running as
+/// root, and by the helper.
+pub(crate) fn open_as_root(device: &DeviceInfo) -> Result<File> {
+    prepare(device)?;
+    // O_EXCL on a block device fails if anything else still holds it mounted.
+    Ok(File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_EXCL)
+        .open(&device.path)?)
+}
+
+/// Needs `sfdisk` (util-linux) and `mkfs.exfat` (exfatprogs), and root.
+pub(crate) fn restore_as_root(device: &DeviceInfo, label: &str) -> Result<()> {
+    let (name, _) = prepare(device)?;
+    run("wipefs", &["--all", &device.path], None)?;
+    run(
+        "sfdisk",
+        &["--quiet", &device.path],
+        Some("label: gpt\n,,EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n"),
+    )?;
+    // Wait for the kernel and udev to create the new partition's node.
+    let _ = run("udevadm", &["settle"], None);
+    // sdb → sdb1; mmcblk0, nvme0n1 (names ending in a digit) → mmcblk0p1.
+    let sep = if name.ends_with(|c: char| c.is_ascii_digit()) {
+        "p"
+    } else {
+        ""
+    };
+    let part = format!("/dev/{name}{sep}1");
+    run("mkfs.exfat", &["-n", label, &part], None)?;
+    Ok(())
+}
+
+/// The device must be a removable whole disk; returns its kernel name and
+/// sysfs directory. Needs no privileges.
+fn check(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
     let name = device.path.strip_prefix("/dev/").unwrap_or("");
     let sys = Path::new("/sys/block").join(name);
     if name.is_empty() || name.contains('/') || !is_candidate(name, &sys) {
@@ -144,10 +172,15 @@ fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
             reason: "not a removable whole disk".into(),
         });
     }
-    if unsafe { libc::geteuid() } != 0 {
-        return Err(Error::Permission(
-            "changing a disk needs root on Linux: run with sudo or pkexec".into(),
-        ));
+    Ok((name.to_string(), sys))
+}
+
+/// Checks `device` is a removable whole disk and that we are root, then
+/// unmounts everything on it. Returns its kernel name and sysfs directory.
+fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
+    let checked = check(device)?;
+    if !is_root() {
+        return Err(Error::Permission("changing a disk needs root".into()));
     }
     for (dev, mountpoint) in mounts() {
         if dev.starts_with(&device.path) {
@@ -161,7 +194,7 @@ fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
             }
         }
     }
-    Ok((name.to_string(), sys))
+    Ok(checked)
 }
 
 fn run(tool: &str, args: &[&str], stdin: Option<&str>) -> Result<()> {

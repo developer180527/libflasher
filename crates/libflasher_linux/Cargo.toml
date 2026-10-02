@@ -16,3 +16,7 @@ libc.workspace = true
 # "removable only" filter, for the CI conformance test. Never enable in a
 # shipped build.
 test-virtual-disks = []
+
+[[bin]]
+name = "libflasher-helper"
+path = "src/bin/libflasher-helper.rs"

@@ -51,3 +51,5 @@
 
 pub use libflasher_core::*;
 pub use libflasher_platform::current as current_platform;
+#[cfg(target_os = "linux")]
+pub use libflasher_platform::linux_helper;

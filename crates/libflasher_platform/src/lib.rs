@@ -10,6 +10,12 @@
 
 use std::sync::Arc;
 
+/// The program libflasher starts through `pkexec` to open disks on Linux.
+/// An app ships it as a binary of its own whose `main` calls
+/// `linux_helper::main`; see `libflasher_linux::helper`.
+#[cfg(target_os = "linux")]
+pub use libflasher_linux::helper as linux_helper;
+
 use libflasher_core::Platform;
 
 pub fn current() -> Arc<dyn Platform> {

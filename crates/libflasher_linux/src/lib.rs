@@ -76,6 +76,9 @@ impl Platform for Linux {
             .parse()
             .unwrap_or(512);
         let size = read(&sys.join("size")).parse::<u64>().unwrap_or(0) * 512;
+        // Whatever the kernel cached of this disk before is not what is on
+        // it now (it may be a different stick at the same name).
+        drop_cache(&file)?;
         Ok(Box::new(Disk { file, size, sector }))
     }
 
@@ -322,9 +325,25 @@ impl RawDevice for Disk {
     fn size(&self) -> u64 {
         self.size
     }
+    /// Also drops the kernel's cached copy of the disk, so a read after
+    /// this — verification — comes from the drive, not from memory.
     fn sync(&mut self) -> Result<()> {
         self.file.sync_all()?;
-        Ok(())
+        drop_cache(&self.file)
+    }
+}
+
+/// Evict the disk's pages from the page cache. The disk is opened buffered,
+/// and without this, reading back what was just written is answered from
+/// memory: verification would pass whatever the drive stored. Only clean
+/// pages are dropped, so call it after `sync_all`. Unlike the `BLKFLSBUF`
+/// ioctl it needs no privilege, which matters when the helper opened the disk.
+fn drop_cache(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // posix_fadvise returns the error number rather than setting errno.
+    match unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
+        0 => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e).into()),
     }
 }
 

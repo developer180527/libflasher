@@ -5,9 +5,10 @@
 //! from a FAT partition, so an ISO that carries that file boots this way
 //! with no bootloader installed by us. That covers most modern installers.
 //! Files are read through UDF when the image has it (Windows ISOs) and ISO
-//! 9660 otherwise. Not covered yet, and refused with a reason rather than
-//! half-done: ISOs with no UEFI bootloader (BIOS-only) and files over FAT32's
-//! 4 GiB limit (current Windows ISOs' `install.wim`, until it can be split).
+//! 9660 otherwise. A Windows `sources/install.wim` too big for FAT32 is
+//! split into `install.swm`, `install2.swm`, … which Windows Setup reads in
+//! its place. Refused with a reason rather than half-done: ISOs with no UEFI
+//! bootloader (BIOS-only) and any other file over FAT32's 4 GiB limit.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -15,15 +16,32 @@ use std::io::{self, BufReader, Read, Seek, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blockio::BlockIo;
-use crate::iso9660::{Entry, Iso};
+use crate::iso9660::{read_extents_range, Entry, Iso};
 use crate::udf::Udf;
+use crate::wim::{self, RangeSource};
 use crate::{gpt, Compression, Error, FlashOptions, ImageInfo, Progress, RawDevice, Result};
 
-/// FAT32 cannot hold a file this large or larger.
-const FAT32_MAX_FILE: u64 = 1 << 32;
 /// fatfs needs at least ~65 k clusters for FAT32; this leaves room.
 const MIN_PARTITION: u64 = 64 << 20;
 const COPY_CHUNK: usize = 1 << 20;
+
+/// The size rules, separate so tests can use small ones.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    /// FAT32 cannot hold a file this large or larger.
+    fat_max_file: u64,
+    /// Largest `.swm` part to make: under the FAT32 limit with room to spare,
+    /// as Microsoft's own tools do.
+    swm_part: u64,
+}
+
+const LIMITS: Limits = Limits {
+    fat_max_file: 1 << 32,
+    swm_part: 4000 << 20,
+};
+
+/// The Windows image that is split when too big for FAT32.
+const INSTALL_WIM: &str = "sources/install.wim";
 
 /// What extracting an ISO would do, worked out without touching a drive.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,18 +49,21 @@ const COPY_CHUNK: usize = 1 << 20;
 pub struct Plan {
     /// The FAT volume name, from the ISO's volume identifier.
     pub label: String,
-    /// Files to copy.
+    /// Files to write.
     pub files: usize,
     /// Bytes in those files.
     pub bytes: u64,
     /// Space the copy needs on the drive, with filesystem overhead.
     pub needs: u64,
+    /// If `install.wim` is split, into how many `.swm` parts.
+    pub wim_parts: Option<usize>,
 }
 
 /// Check an ISO can be extracted, and say what that would take.
 pub fn plan(image: &ImageInfo) -> Result<Plan> {
-    let (entries, label) = read_tree(image)?;
-    plan_for(&entries, label)
+    let mut src = Source::open(image)?;
+    let items = items(&mut src, LIMITS)?;
+    plan_for(&items, &src.volume_id())
 }
 
 /// The image's files, through whichever filesystem holds them: UDF when the
@@ -85,29 +106,117 @@ impl Source {
         }
     }
 
-    fn read_file(
+    fn read_range(
         &mut self,
         e: &Entry,
+        start: u64,
+        len: u64,
         buf: &mut [u8],
-        sink: impl FnMut(&[u8]) -> io::Result<()>,
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         match self {
-            Source::Iso(i) => i.read_file(e, buf, sink),
-            Source::Udf(u) => u.read_file(e, buf, sink),
+            Source::Iso(i) => read_extents_range(i.reader(), e, start, len, buf, sink),
+            Source::Udf(u) => read_extents_range(u.reader(), e, start, len, buf, sink),
         }
     }
 }
 
-fn read_tree(image: &ImageInfo) -> Result<(Vec<Entry>, String)> {
-    let mut src = Source::open(image)?;
-    let label = src.volume_id();
-    Ok((src.walk()?, label))
+/// One file inside the image, read as a whole: what the WIM splitter reads from.
+struct InImage<'a> {
+    src: &'a mut Source,
+    file: &'a Entry,
 }
 
-fn plan_for(entries: &[Entry], volume_id: String) -> Result<Plan> {
-    let uefi = entries.iter().any(|e| {
-        let p = e.path.to_ascii_lowercase();
-        !e.is_dir && p.starts_with("efi/boot/boot") && p.ends_with(".efi")
+impl RangeSource for InImage<'_> {
+    fn read_range(
+        &mut self,
+        offset: u64,
+        len: u64,
+        buf: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.src.read_range(self.file, offset, len, buf, sink)
+    }
+}
+
+/// Something to put on the drive.
+enum Item {
+    Dir(String),
+    /// A file copied as it is.
+    File(Entry),
+    /// One part of a split `install.wim`, generated from it.
+    Swm {
+        path: String,
+        wim: Entry,
+        part: wim::Part,
+    },
+}
+
+impl Item {
+    fn path(&self) -> &str {
+        match self {
+            Item::Dir(p) | Item::Swm { path: p, .. } => p,
+            Item::File(e) => &e.path,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Item::Dir(_) => 0,
+            Item::File(e) => e.size,
+            Item::Swm { part, .. } => part.size,
+        }
+    }
+
+    /// Produce the item's bytes, as they go on the drive.
+    fn produce(
+        &self,
+        src: &mut Source,
+        buf: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Item::Dir(_) => Ok(()),
+            Item::File(e) => src.read_range(e, 0, e.size, buf, sink),
+            Item::Swm { wim, part, .. } => part.stream(&mut InImage { src, file: wim }, buf, sink),
+        }
+    }
+}
+
+/// The image's files as items, with an oversized `install.wim` split.
+fn items(src: &mut Source, limits: Limits) -> Result<Vec<Item>> {
+    let entries = src.walk()?;
+    let mut out = Vec::with_capacity(entries.len() + 2);
+    for e in entries {
+        if e.is_dir {
+            out.push(Item::Dir(e.path));
+        } else if e.size >= limits.fat_max_file && e.path.eq_ignore_ascii_case(INSTALL_WIM) {
+            let dir = &e.path[..e.path.len() - "install.wim".len()];
+            let parts = wim::split(
+                &mut InImage { src, file: &e },
+                e.size,
+                limits.swm_part,
+                "install",
+            )
+            .map_err(Error::Unsupported)?;
+            for part in parts {
+                out.push(Item::Swm {
+                    path: format!("{dir}{}", part.name),
+                    wim: e.clone(),
+                    part,
+                });
+            }
+        } else {
+            out.push(Item::File(e));
+        }
+    }
+    Ok(out)
+}
+
+fn plan_for(items: &[Item], volume_id: &str) -> Result<Plan> {
+    let uefi = items.iter().any(|i| {
+        let p = i.path().to_ascii_lowercase();
+        matches!(i, Item::File(_)) && p.starts_with("efi/boot/boot") && p.ends_with(".efi")
     });
     if !uefi {
         return Err(Error::Unsupported(
@@ -116,42 +225,47 @@ fn plan_for(entries: &[Entry], volume_id: String) -> Result<Plan> {
                 .into(),
         ));
     }
-    if let Some(big) = entries
-        .iter()
-        .find(|e| !e.is_dir && e.size >= FAT32_MAX_FILE)
-    {
+    if let Some(big) = items.iter().find(|i| i.size() >= LIMITS.fat_max_file) {
         return Err(Error::Unsupported(format!(
-            "{} is {}, over FAT32's 4 GB limit for one file; splitting it is not supported yet",
-            big.path,
-            crate::platform::human_size(big.size)
+            "{} is {}, over FAT32's 4 GB limit for one file; only Windows' install.wim can be split",
+            big.path(),
+            crate::platform::human_size(big.size())
         )));
     }
     // FAT compares names without case: two names differing only in case
     // would silently become one file.
     let mut seen = HashSet::new();
-    for e in entries {
-        if !seen.insert(fat_path(&e.path).to_lowercase()) {
+    for i in items {
+        if !seen.insert(fat_path(i.path()).to_lowercase()) {
             return Err(Error::Unsupported(format!(
                 "{} differs from another file only in letter case, which FAT cannot hold",
-                e.path
+                i.path()
             )));
         }
     }
-    let files: Vec<&Entry> = entries.iter().filter(|e| !e.is_dir).collect();
-    let bytes: u64 = files.iter().map(|e| e.size).sum();
+    let files: Vec<&Item> = items
+        .iter()
+        .filter(|i| !matches!(i, Item::Dir(_)))
+        .collect();
+    let bytes: u64 = files.iter().map(|i| i.size()).sum();
     // Clusters are at most 32 KiB on the sizes we format; round every file
     // up to one, add the FATs and directories generously.
     let needs = files
         .iter()
-        .map(|e| e.size.div_ceil(32 << 10) * (32 << 10))
+        .map(|i| i.size().div_ceil(32 << 10) * (32 << 10))
         .sum::<u64>()
         + bytes / 64
         + (16 << 20);
+    let swm = items
+        .iter()
+        .filter(|i| matches!(i, Item::Swm { .. }))
+        .count();
     Ok(Plan {
-        label: fat_label(&volume_id),
+        label: fat_label(volume_id),
         files: files.len(),
         bytes,
         needs,
+        wim_parts: (swm > 0).then_some(swm),
     })
 }
 
@@ -190,7 +304,7 @@ fn fat_label(volume_id: &str) -> String {
     }
 }
 
-/// Make the drive a FAT32 copy of the ISO's files. Returns the bytes copied.
+/// Make the drive a FAT32 copy of the ISO's files. Returns the bytes written.
 pub fn extract(
     image: &ImageInfo,
     device: &mut dyn RawDevice,
@@ -198,8 +312,20 @@ pub fn extract(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<u64> {
-    let (entries, volume_id) = read_tree(image)?;
-    let plan = plan_for(&entries, volume_id)?;
+    extract_with(image, device, options, cancel, progress, LIMITS)
+}
+
+fn extract_with(
+    image: &ImageInfo,
+    device: &mut dyn RawDevice,
+    options: &FlashOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress),
+    limits: Limits,
+) -> Result<u64> {
+    let mut src = Source::open(image)?;
+    let items = items(&mut src, limits)?;
+    let plan = plan_for(&items, &src.volume_id())?;
     let sector = device.sector_size().max(512) as u64;
     let layout = gpt::layout(device.size(), sector).filter(|l| l.len >= MIN_PARTITION);
     let Some(layout) = layout.filter(|l| l.len >= plan.needs) else {
@@ -211,7 +337,6 @@ pub fn extract(
 
     progress(Progress::Formatting);
     gpt::write(device, &plan.label).map_err(|e| Error::Io(e).at_device(0))?;
-    let mut iso = Source::open(image)?;
     let mut io = BlockIo::new(
         device,
         layout.start,
@@ -250,12 +375,12 @@ pub fn extract(
             done: 0,
             total: plan.bytes,
         });
-        for e in &entries {
+        for item in &items {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
-            let path = fat_path(&e.path);
-            if e.is_dir {
+            let path = fat_path(item.path());
+            if let Item::Dir(_) = item {
                 root.create_dir(&path)
                     .map_err(|err| device_err(err, done))?;
                 continue;
@@ -264,7 +389,7 @@ pub fn extract(
                 .create_file(&path)
                 .map_err(|err| device_err(err, done))?;
             let mut write_err = None;
-            let read = iso.read_file(e, &mut buf, |chunk| {
+            let read = item.produce(&mut src, &mut buf, &mut |chunk| {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                 }
@@ -300,8 +425,8 @@ pub fn extract(
         io.drop_cache();
         verify(
             &mut io,
-            &mut iso,
-            &entries,
+            &mut src,
+            &items,
             plan.bytes,
             cancel,
             progress,
@@ -311,11 +436,12 @@ pub fn extract(
     Ok(done)
 }
 
-/// Read every file back from the drive and compare it with the ISO.
+/// Read every file back from the drive and compare it with what was meant
+/// to be written: the ISO's bytes, or the generated `.swm` parts.
 fn verify(
     io: &mut BlockIo,
-    iso: &mut Source,
-    entries: &[Entry],
+    src: &mut Source,
+    items: &[Item],
     total: u64,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Progress),
@@ -328,16 +454,16 @@ fn verify(
     let mut verified = 0u64;
     let mut want = vec![0u8; COPY_CHUNK];
     let mut got = vec![0u8; COPY_CHUNK];
-    for e in entries.iter().filter(|e| !e.is_dir) {
+    for item in items.iter().filter(|i| !matches!(i, Item::Dir(_))) {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
         let mut f = root
-            .open_file(&fat_path(&e.path))
+            .open_file(&fat_path(item.path()))
             .map_err(|err| device_err(err, verified))?;
         let mut mismatch = None;
         let mut read_err = None;
-        iso.read_file(e, &mut want, |chunk| {
+        item.produce(src, &mut want, &mut |chunk| {
             let g = &mut got[..chunk.len()];
             if let Err(err) = f.read_exact(g) {
                 read_err = Some(err);
@@ -481,21 +607,96 @@ mod tests {
 
     #[test]
     fn plans_reject_case_clashes_and_huge_files() {
-        let e = |path: &str, size: u64| Entry::for_tests(path, size);
-        let boot = e("EFI/BOOT/BOOTX64.EFI", 10);
-        assert!(plan_for(
-            &[boot.clone(), e("a/Readme", 1), e("a/README", 1)],
-            "X".into()
-        )
-        .is_err());
-        assert!(plan_for(
-            &[boot.clone(), e("sources/install.wim", 5 << 30)],
-            "X".into()
-        )
-        .is_err());
-        let p = plan_for(&[boot, e("x", 100)], "Ubuntu 26.04 LTS amd64".into()).unwrap();
+        let f = |path: &str, size: u64| Item::File(Entry::for_tests(path, size));
+        let boot = || f("EFI/BOOT/BOOTX64.EFI", 10);
+        assert!(plan_for(&[boot(), f("a/Readme", 1), f("a/README", 1)], "X").is_err());
+        let e = plan_for(&[boot(), f("data/huge.img", 5 << 30)], "X").unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("only Windows' install.wim can be split"),
+            "{e}"
+        );
+        let p = plan_for(&[boot(), f("x", 100)], "Ubuntu 26.04 LTS amd64").unwrap();
         assert_eq!(p.label, "UBUNTU 26_0");
         assert_eq!(p.files, 2);
+        assert_eq!(p.wim_parts, None);
+    }
+
+    /// A Windows-shaped ISO whose install.wim is "too big" under small test
+    /// limits: it must arrive as install.swm + install2.swm + …, each
+    /// exactly what the splitter makes, and no install.wim.
+    #[test]
+    fn splits_an_oversized_install_wim_while_extracting() {
+        let wim = crate::wim::tests::wim(2, &[600_000, 500_000, 700_000, 400_000, 650_000]);
+        let fs_ = vec![
+            IsoFile {
+                path: "EFI/BOOT/BOOTX64.EFI",
+                data: vec![0xEF; 10_000],
+            },
+            IsoFile {
+                path: "setup.exe",
+                data: b"MZ".to_vec(),
+            },
+            IsoFile {
+                path: "sources/install.wim",
+                data: wim.clone(),
+            },
+        ];
+        let img = temp("win.iso", &iso("CCCOMA_X64", &fs_, true));
+        let info = crate::image::inspect(&img).unwrap();
+        let disk = temp("win.disk", &vec![0u8; 96 << 20]);
+        let mut dev = FileDevice::open(&disk).unwrap();
+        let limits = Limits {
+            fat_max_file: 1 << 20,
+            swm_part: 1_200_000,
+        };
+        extract_with(
+            &info,
+            &mut dev,
+            &FlashOptions::default(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            limits,
+        )
+        .unwrap();
+        drop(dev);
+
+        let expected =
+            crate::wim::split(&mut &wim[..], wim.len() as u64, limits.swm_part, "install").unwrap();
+        assert!(expected.len() >= 2);
+        let raw = std::fs::read(&disk).unwrap();
+        let fat = fatfs::FileSystem::new(
+            std::io::Cursor::new(raw[1 << 20..].to_vec()),
+            fatfs::FsOptions::new(),
+        )
+        .unwrap();
+        let sources = fat.root_dir().open_dir("sources").unwrap();
+        let names: Vec<String> = sources
+            .iter()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case("install.wim")),
+            "{names:?}"
+        );
+        for part in &expected {
+            let mut want = Vec::new();
+            part.stream(&mut &wim[..], &mut [0u8; 4096], &mut |b| {
+                want.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+            let mut got = Vec::new();
+            sources
+                .open_file(&part.name)
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert!(got == want, "{} differs", part.name);
+        }
+        std::fs::remove_file(img).ok();
+        std::fs::remove_file(disk).ok();
     }
 
     /// Extract the ISO in `FLASHER_TEST_ISO` into the file `FLASHER_TEST_OUT`

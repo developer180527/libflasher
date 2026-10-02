@@ -339,6 +339,11 @@ impl<R: Read + Seek> Udf<R> {
         Ok(out)
     }
 
+    /// The image, for ranged reads of the entries this returned.
+    pub(crate) fn reader(&mut self) -> &mut R {
+        &mut self.r
+    }
+
     /// Stream a file's bytes to `sink`, in pieces of at most `buf.len()`.
     pub fn read_file(
         &mut self,

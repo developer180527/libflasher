@@ -131,6 +131,38 @@ jobs:
             -drive file=disk.img,format=raw,if=virtio | tee serial.log || true
           grep -q FLASHER_BOOT_OK serial.log
 
+  wim-split:
+    # Splitting install.wim, judged by wimlib (an independent WIM
+    # implementation, used here only as a test tool): it captures a real
+    # LZX-compressed WIM, libflasher splits it, and wimlib must verify every
+    # resource's SHA-1 and apply the split set back to identical files.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y wimtools
+      - name: capture a WIM of random files
+        run: |
+          mkdir -p data/sub
+          for i in 1 2 3 4 5 6 7 8; do head -c 5M /dev/urandom > "data/file$i.bin"; done
+          head -c 300K /dev/urandom > data/sub/small.bin
+          echo "a text file" > "data/sub/Ünïcode name.txt"
+          wimlib-imagex capture data test.wim "Test" --compress=LZX
+          wimlib-imagex info test.wim
+      - name: split it with libflasher (12 MB parts)
+        run: |
+          FLASHER_TEST_WIM=$PWD/test.wim FLASHER_TEST_SWM_DIR=$PWD/out FLASHER_TEST_SWM_PART=12000000 \
+            cargo test -p libflasher_core split_wim_to_dir -- --ignored --nocapture
+          ls -l out
+          test -f out/install2.swm
+      - name: wimlib verifies and applies the split set
+        run: |
+          wimlib-imagex info out/install.swm
+          wimlib-imagex verify out/install.swm --ref="out/install*.swm"
+          wimlib-imagex apply out/install.swm 1 applied --ref="out/install*.swm"
+          diff -r data applied
+
   docs:
     name: docs and formatting
     runs-on: ubuntu-latest

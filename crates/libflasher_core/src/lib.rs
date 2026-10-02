@@ -21,6 +21,7 @@ pub mod mock;
 pub mod platform;
 pub mod rate;
 pub mod udf;
+mod wim;
 mod xz_size;
 
 pub use error::{Error, Result};

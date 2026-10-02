@@ -76,6 +76,51 @@ pub(crate) fn read_extents<R: Read + Seek>(
     Ok(())
 }
 
+/// Like [`read_extents`], for the bytes `[start, start + len)` of the entry.
+pub(crate) fn read_extents_range<R: Read + Seek>(
+    r: &mut R,
+    e: &Entry,
+    start: u64,
+    len: u64,
+    buf: &mut [u8],
+    sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    if start.checked_add(len).is_none_or(|end| end > e.size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "read past the end of a file in the image",
+        ));
+    }
+    let (mut skip, mut left) = (start, len);
+    for &(offset, ext_len) in &e.extents {
+        if left == 0 {
+            break;
+        }
+        if skip >= ext_len {
+            skip -= ext_len;
+            continue;
+        }
+        let hole = offset == HOLE;
+        if !hole {
+            r.seek(SeekFrom::Start(offset + skip))?;
+        }
+        let mut here = (ext_len - skip).min(left);
+        skip = 0;
+        while here > 0 {
+            let n = (buf.len() as u64).min(here) as usize;
+            if hole {
+                buf[..n].fill(0);
+            } else {
+                r.read_exact(&mut buf[..n])?;
+            }
+            sink(&buf[..n])?;
+            here -= n as u64;
+            left -= n as u64;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl Entry {
     pub(crate) fn for_tests(path: &str, size: u64) -> Self {
@@ -343,6 +388,11 @@ impl<R: Read + Seek> Iso<R> {
             all.extend_from_slice(&area);
         }
         Ok(all)
+    }
+
+    /// The image, for ranged reads of the entries this returned.
+    pub(crate) fn reader(&mut self) -> &mut R {
+        &mut self.r
     }
 
     /// Stream a file's bytes to `sink`, in pieces of at most `buf.len()`.
@@ -620,6 +670,24 @@ mod tests {
     fn refuses_what_is_not_an_iso() {
         assert!(Iso::open(Cursor::new(vec![0u8; 64 * 2048])).is_err());
         assert!(Iso::open(Cursor::new(vec![0u8; 100])).is_err());
+    }
+
+    #[test]
+    fn reads_ranges_across_extents_and_holes() {
+        // Bytes 0..10 at offset 100, a 5-byte hole, then 0..10 at offset 200.
+        let mut img = vec![0u8; 300];
+        img[100..110].copy_from_slice(b"ABCDEFGHIJ");
+        img[200..210].copy_from_slice(b"KLMNOPQRST");
+        let e = Entry::new("f".into(), false, 25, vec![(100, 10), (HOLE, 5), (200, 10)]);
+        let mut r = Cursor::new(img);
+        let mut got = Vec::new();
+        read_extents_range(&mut r, &e, 7, 11, &mut [0u8; 4], &mut |b| {
+            got.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, b"HIJ\0\0\0\0\0KLM");
+        assert!(read_extents_range(&mut r, &e, 20, 6, &mut [0u8; 4], &mut |_| Ok(())).is_err());
     }
 
     #[test]

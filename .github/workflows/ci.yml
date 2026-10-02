@@ -1,0 +1,107 @@
+# Builds, lints and tests libflasher on the three platforms it supports.
+#
+# `test` runs every unit test, including each backend's read-only tests
+# against the runner's real disks (listing, refusing the system disk,
+# keep-awake). `conformance` then writes for real: each job creates a
+# throwaway virtual disk, names it in FLASHER_TEST_DISK, and runs the
+# backend's full cycle (list, open, flash, verify, restore) against it. No
+# real disk is ever written; the test also refuses anything over 512 MiB.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test --workspace
+
+  conformance-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y exfatprogs
+      - run: cargo test -p libflasher_linux --features test-virtual-disks --no-run
+      - name: create a 256 MiB loop device
+        run: |
+          truncate -s 256M "$RUNNER_TEMP/disk.img"
+          dev=$(sudo losetup --find --show --partscan "$RUNNER_TEMP/disk.img")
+          echo "FLASHER_TEST_DISK=$dev" >> "$GITHUB_ENV"
+      - name: conformance (as root, as writing a disk requires)
+        run: |
+          test -n "$FLASHER_TEST_DISK"
+          sudo -E env "PATH=$PATH" cargo test -p libflasher_linux --features test-virtual-disks -- --ignored --nocapture
+
+  conformance-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p libflasher_macos --features test-virtual-disks --no-run
+      - name: attach a 256 MiB disk image without mounting it
+        run: |
+          hdiutil create -size 256m -layout NONE -type UDIF "$RUNNER_TEMP/disk"
+          dev=$(hdiutil attach -nomount "$RUNNER_TEMP/disk.dmg" | head -1 | awk '{print $1}')
+          echo "FLASHER_TEST_DISK=$dev" >> "$GITHUB_ENV"
+      - name: conformance (as root, so no authopen prompt is needed)
+        run: |
+          test -n "$FLASHER_TEST_DISK"
+          sudo -E env "PATH=$PATH" cargo test -p libflasher_macos --features test-virtual-disks -- --ignored --nocapture
+
+  conformance-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p libflasher_windows --features test-virtual-disks --no-run
+      - name: create and attach a 256 MiB VHD
+        shell: pwsh
+        run: |
+          $vhd = "$env:RUNNER_TEMP\disk.vhdx"
+          "create vdisk file=`"$vhd`" maximum=256 type=expandable`r`nattach vdisk`r`n" |
+            Out-File -Encoding ascii "$env:RUNNER_TEMP\mkdisk.txt"
+          diskpart /s "$env:RUNNER_TEMP\mkdisk.txt"
+          $n = (Get-DiskImage -ImagePath $vhd | Get-Disk).Number
+          "FLASHER_TEST_DISK=\\.\PhysicalDrive$n" >> $env:GITHUB_ENV
+      - name: conformance (runners are elevated)
+        shell: pwsh
+        run: |
+          if (-not $env:FLASHER_TEST_DISK) { exit 1 }
+          cargo test -p libflasher_windows --features test-virtual-disks -- --ignored --nocapture
+
+  docs:
+    name: docs and formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

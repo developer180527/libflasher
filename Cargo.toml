@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/libflasher",
+    "crates/libflasher_core",
+    "crates/libflasher_platform",
+    "crates/libflasher_macos",
+    "crates/libflasher_linux",
+    "crates/libflasher_windows",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Venu Gopal"]
+rust-version = "1.90"
+repository = "https://github.com/developer180527/libflasher"
+
+[workspace.dependencies]
+libflasher_core = { path = "crates/libflasher_core", version = "0.1.0", default-features = false }
+libflasher_platform = { path = "crates/libflasher_platform", version = "0.1.0" }
+thiserror = "2"
+libc = "0.2"

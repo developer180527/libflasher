@@ -1,0 +1,29 @@
+[package]
+name = "libflasher_windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Windows backend: \\\\.\\PhysicalDriveN, volume locking, power requests, diskpart."
+
+[dependencies]
+libflasher_core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Power",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+] }
+
+[features]
+# Lets the one virtual disk named in FLASHER_TEST_DISK through the
+# "removable only" filter, for the CI conformance test. Never enable in a
+# shipped build.
+test-virtual-disks = []

@@ -1,0 +1,18 @@
+[package]
+name = "libflasher_linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libflasher_core.workspace = true
+libc.workspace = true
+
+[features]
+# Lets the one virtual disk named in FLASHER_TEST_DISK through the
+# "removable only" filter, for the CI conformance test. Never enable in a
+# shipped build.
+test-virtual-disks = []

@@ -1,0 +1,29 @@
+[package]
+name = "libflasher_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OS-independent core: image detection, decompression, the write/verify pipeline, and the Platform trait every OS implements."
+
+[dependencies]
+thiserror.workspace = true
+sha2 = "0.10"
+flate2 = { version = "1", optional = true }
+xz2 = { version = "0.1", optional = true }
+zstd = { version = "0.13", optional = true }
+bzip2 = { version = "0.5", optional = true }
+
+[features]
+# Decompressors. All but gzip build C code; turn one off and images in that
+# format are refused with a clear error instead.
+default = ["gzip", "xz", "zstd", "bzip2"]
+gzip = ["dep:flate2"]
+xz = ["dep:xz2"]
+zstd = ["dep:zstd"]
+bzip2 = ["dep:bzip2"]
+
+[dev-dependencies]
+flate2 = "1"

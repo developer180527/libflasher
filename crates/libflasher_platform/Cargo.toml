@@ -1,0 +1,21 @@
+[package]
+name = "libflasher_platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Picks the Platform implementation for the OS being built for."
+
+[dependencies]
+libflasher_core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libflasher_macos = { path = "../libflasher_macos", version = "0.1.0" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libflasher_linux = { path = "../libflasher_linux", version = "0.1.0" }
+
+[target.'cfg(windows)'.dependencies]
+libflasher_windows = { path = "../libflasher_windows", version = "0.1.0" }

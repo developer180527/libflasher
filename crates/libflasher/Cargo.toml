@@ -1,0 +1,22 @@
+[package]
+name = "libflasher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Write disk images to USB drives and SD cards: image detection, decompression, checksums, write and verify, on macOS, Linux and Windows."
+keywords = ["usb", "flash", "disk-image", "iso", "raspberry-pi"]
+categories = ["filesystem", "command-line-utilities"]
+
+[features]
+default = ["gzip", "xz", "zstd", "bzip2"]
+gzip = ["libflasher_core/gzip"]
+xz = ["libflasher_core/xz"]
+zstd = ["libflasher_core/zstd"]
+bzip2 = ["libflasher_core/bzip2"]
+
+[dependencies]
+libflasher_core.workspace = true
+libflasher_platform.workspace = true

@@ -69,7 +69,12 @@ impl ImageKind {
     fn classify(head: &[u8]) -> Self {
         let mbr = head.len() >= 512 && head[510] == 0x55 && head[511] == 0xAA;
         let gpt = head.len() >= 520 && &head[512..520] == b"EFI PART";
-        let iso = head.len() >= 0x8006 && &head[0x8001..0x8006] == b"CD001";
+        let iso9660 = head.len() >= 0x8006 && &head[0x8001..0x8006] == b"CD001";
+        // A UDF-only disc image has no CD001, just its recognition sequence
+        // (BEA01, NSR02/03, TEA01) in the same place.
+        let udf = (16..head.len() / 2048)
+            .any(|s| matches!(&head[s * 2048 + 1..s * 2048 + 6], b"NSR02" | b"NSR03"));
+        let iso = iso9660 || udf;
         match (iso, mbr || gpt) {
             (true, true) => Self::HybridIso,
             (true, false) => Self::PlainIso,
@@ -249,6 +254,14 @@ mod tests {
         gpt[512..520].copy_from_slice(b"EFI PART");
         assert_eq!(ImageKind::classify(&gpt), ImageKind::RawDisk);
         assert_eq!(ImageKind::classify(&[0u8; 100]), ImageKind::Unknown);
+        let mut udf = vec![0u8; HEAD];
+        udf[0x8001..0x8006].copy_from_slice(b"BEA01");
+        udf[0x8801..0x8806].copy_from_slice(b"NSR02");
+        assert_eq!(
+            ImageKind::classify(&udf),
+            ImageKind::PlainIso,
+            "UDF-only image"
+        );
     }
 
     #[test]

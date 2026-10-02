@@ -4,9 +4,10 @@
 //! UEFI firmware boots removable media by running `\EFI\BOOT\BOOT<arch>.EFI`
 //! from a FAT partition, so an ISO that carries that file boots this way
 //! with no bootloader installed by us. That covers most modern installers.
-//! Not covered yet, and refused with a reason rather than half-done: ISOs
-//! with no UEFI bootloader (BIOS-only), files over FAT32's 4 GiB limit, and
-//! Windows ISOs (their files are in UDF, which is next).
+//! Files are read through UDF when the image has it (Windows ISOs) and ISO
+//! 9660 otherwise. Not covered yet, and refused with a reason rather than
+//! half-done: ISOs with no UEFI bootloader (BIOS-only) and files over FAT32's
+//! 4 GiB limit (current Windows ISOs' `install.wim`, until it can be split).
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blockio::BlockIo;
 use crate::iso9660::{Entry, Iso};
+use crate::udf::Udf;
 use crate::{gpt, Compression, Error, FlashOptions, ImageInfo, Progress, RawDevice, Result};
 
 /// FAT32 cannot hold a file this large or larger.
@@ -43,16 +45,63 @@ pub fn plan(image: &ImageInfo) -> Result<Plan> {
     plan_for(&entries, label)
 }
 
-fn read_tree(image: &ImageInfo) -> Result<(Vec<Entry>, String)> {
-    if image.compression != Compression::None {
-        return Err(Error::Unsupported(format!(
-            "extracting a {}-compressed ISO; decompress it first",
-            image.compression.name()
-        )));
+/// The image's files, through whichever filesystem holds them: UDF when the
+/// image has one (Windows ISOs, whose ISO 9660 tree is only a readme), ISO
+/// 9660 otherwise.
+enum Source {
+    Iso(Iso<BufReader<File>>),
+    Udf(Udf<BufReader<File>>),
+}
+
+impl Source {
+    fn open(image: &ImageInfo) -> Result<Self> {
+        if image.compression != Compression::None {
+            return Err(Error::Unsupported(format!(
+                "extracting a {}-compressed ISO; decompress it first",
+                image.compression.name()
+            )));
+        }
+        let mut f = BufReader::new(File::open(&image.path)?);
+        if crate::udf::is_udf(&mut f)? {
+            return Udf::open(f).map(Source::Udf).map_err(|e| match e.kind() {
+                io::ErrorKind::Unsupported => Error::Unsupported(e.to_string()),
+                _ => Error::Io(e),
+            });
+        }
+        Ok(Source::Iso(Iso::open(f)?))
     }
-    let mut iso = Iso::open(BufReader::new(File::open(&image.path)?))?;
-    let label = iso.volume_id.clone();
-    Ok((iso.walk()?, label))
+
+    fn volume_id(&self) -> String {
+        match self {
+            Source::Iso(i) => i.volume_id.clone(),
+            Source::Udf(u) => u.volume_id.clone(),
+        }
+    }
+
+    fn walk(&mut self) -> io::Result<Vec<Entry>> {
+        match self {
+            Source::Iso(i) => i.walk(),
+            Source::Udf(u) => u.walk(),
+        }
+    }
+
+    fn read_file(
+        &mut self,
+        e: &Entry,
+        buf: &mut [u8],
+        sink: impl FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Source::Iso(i) => i.read_file(e, buf, sink),
+            Source::Udf(u) => u.read_file(e, buf, sink),
+        }
+    }
+}
+
+fn read_tree(image: &ImageInfo) -> Result<(Vec<Entry>, String)> {
+    let mut src = Source::open(image)?;
+    let label = src.volume_id();
+    Ok((src.walk()?, label))
 }
 
 fn plan_for(entries: &[Entry], volume_id: String) -> Result<Plan> {
@@ -162,7 +211,7 @@ pub fn extract(
 
     progress(Progress::Formatting);
     gpt::write(device, &plan.label).map_err(|e| Error::Io(e).at_device(0))?;
-    let mut iso = Iso::open(BufReader::new(File::open(&image.path)?))?;
+    let mut iso = Source::open(image)?;
     let mut io = BlockIo::new(
         device,
         layout.start,
@@ -265,7 +314,7 @@ pub fn extract(
 /// Read every file back from the drive and compare it with the ISO.
 fn verify(
     io: &mut BlockIo,
-    iso: &mut Iso<BufReader<File>>,
+    iso: &mut Source,
     entries: &[Entry],
     total: u64,
     cancel: &AtomicBool,
@@ -476,6 +525,11 @@ mod tests {
             &mut |_| {},
         )
         .unwrap();
-        println!("extracted {n} bytes from {iso} into {out}");
+        let through = if crate::udf::is_udf(&mut std::fs::File::open(&iso).unwrap()).unwrap() {
+            "UDF"
+        } else {
+            "ISO 9660"
+        };
+        println!("extracted {n} bytes from {iso} into {out}, read through {through}");
     }
 }

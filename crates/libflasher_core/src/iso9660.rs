@@ -33,6 +33,49 @@ pub struct Entry {
     extents: Vec<(u64, u64)>,
 }
 
+/// An extent with this offset is a hole: it reads as zeros (UDF sparse
+/// extents, "allocated but not recorded").
+pub(crate) const HOLE: u64 = u64::MAX;
+
+impl Entry {
+    pub(crate) fn new(path: String, is_dir: bool, size: u64, extents: Vec<(u64, u64)>) -> Self {
+        Entry {
+            path,
+            is_dir,
+            size,
+            extents,
+        }
+    }
+}
+
+/// Stream an entry's bytes from the image `r` to `sink`, in pieces of at
+/// most `buf.len()`. Shared by the ISO 9660 and UDF readers.
+pub(crate) fn read_extents<R: Read + Seek>(
+    r: &mut R,
+    e: &Entry,
+    buf: &mut [u8],
+    mut sink: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    for &(offset, len) in &e.extents {
+        let hole = offset == HOLE;
+        if !hole {
+            r.seek(SeekFrom::Start(offset))?;
+        }
+        let mut left = len;
+        while left > 0 {
+            let n = (buf.len() as u64).min(left) as usize;
+            if hole {
+                buf[..n].fill(0);
+            } else {
+                r.read_exact(&mut buf[..n])?;
+            }
+            sink(&buf[..n])?;
+            left -= n as u64;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl Entry {
     pub(crate) fn for_tests(path: &str, size: u64) -> Self {
@@ -144,7 +187,33 @@ impl<R: Read + Seek> Iso<R> {
         }
         let name_len = data[32] as usize;
         let su_start = 33 + name_len + (1 - name_len % 2);
-        Ok(su_start + 4 <= len && &data[su_start..su_start + 2] == b"SP")
+        if !(su_start + 4 <= len && &data[su_start..su_start + 2] == b"SP") {
+            return Ok(false);
+        }
+        // Rock Ridge is announced, but it only beats Joliet if it actually
+        // carries names: some writers (macOS's `hdiutil`) record permissions
+        // and times with no `NM`, which leaves the plain ISO 9660 names —
+        // upper case, accents dropped — where Joliet has the real ones.
+        let mut pos = 0;
+        while pos < data.len() {
+            let rec_len = data[pos] as usize;
+            if rec_len == 0 {
+                break;
+            }
+            if rec_len < 34 || pos + rec_len > data.len() {
+                return Ok(false);
+            }
+            let rec = &data[pos..pos + rec_len];
+            pos += rec_len;
+            let nl = rec[32] as usize;
+            if 33 + nl > rec.len() || rec[33..33 + nl] == [0] || rec[33..33 + nl] == [1] {
+                continue;
+            }
+            let inline = rec[(33 + nl + (1 - nl % 2)).min(rec.len())..].to_vec();
+            let su = self.system_use(&inline)?;
+            return Ok(rr_name(&su).is_some());
+        }
+        Ok(true) // an empty root: names do not matter
     }
 
     fn read_extent(&mut self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
@@ -218,17 +287,20 @@ impl<R: Read + Seek> Iso<R> {
                 continuing = flags & 0x80 != 0;
                 continue;
             }
-            let su = &rec[(33 + name_len + (1 - name_len % 2)).min(rec.len())..];
+            let inline = &rec[(33 + name_len + (1 - name_len % 2)).min(rec.len())..];
+            let su = if self.names == Names::RockRidge {
+                self.system_use(inline)?
+            } else {
+                Vec::new()
+            };
+            let su = su.as_slice();
             if self.names == Names::RockRidge && susp(su, b"SL").is_some() {
                 // A symlink: nothing a FAT drive can hold.
                 continuing = flags & 0x80 != 0;
                 continue;
             }
             let name = match self.names {
-                Names::RockRidge => susp(su, b"NM")
-                    .filter(|nm| nm.len() > 1)
-                    .map(|nm| String::from_utf8_lossy(&nm[1..]).into_owned())
-                    .unwrap_or_else(|| plain_name(raw)),
+                Names::RockRidge => rr_name(su).unwrap_or_else(|| plain_name(raw)),
                 Names::Joliet => joliet_name(raw),
                 Names::Iso9660 => plain_name(raw),
             };
@@ -251,24 +323,36 @@ impl<R: Read + Seek> Iso<R> {
         Ok(out)
     }
 
+    /// A record's System Use entries: the ones inline, then those in any
+    /// continuation areas (`CE`) they point to, where Rock Ridge puts what
+    /// does not fit — often the name.
+    fn system_use(&mut self, inline: &[u8]) -> io::Result<Vec<u8>> {
+        let mut all = inline.to_vec();
+        let mut next = susp(inline, b"CE").map(<[u8]>::to_vec);
+        for _ in 0..8 {
+            let Some(ce) = next.take() else { break };
+            if ce.len() < 24 {
+                return Err(bad("short CE entry"));
+            }
+            let (block, offset, len) = (le32(&ce[0..]), le32(&ce[8..]), le32(&ce[16..]));
+            if offset + len > SECTOR {
+                return Err(bad("CE area out of bounds"));
+            }
+            let area = self.read_extent(block * SECTOR + offset, len)?;
+            next = susp(&area, b"CE").map(<[u8]>::to_vec);
+            all.extend_from_slice(&area);
+        }
+        Ok(all)
+    }
+
     /// Stream a file's bytes to `sink`, in pieces of at most `buf.len()`.
     pub fn read_file(
         &mut self,
         e: &Entry,
         buf: &mut [u8],
-        mut sink: impl FnMut(&[u8]) -> io::Result<()>,
+        sink: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        for &(offset, len) in &e.extents {
-            self.r.seek(SeekFrom::Start(offset))?;
-            let mut left = len;
-            while left > 0 {
-                let n = (buf.len() as u64).min(left) as usize;
-                self.r.read_exact(&mut buf[..n])?;
-                sink(&buf[..n])?;
-                left -= n as u64;
-            }
-        }
-        Ok(())
+        read_extents(&mut self.r, e, buf, sink)
     }
 }
 
@@ -285,6 +369,32 @@ fn susp<'a>(mut su: &'a [u8], sig: &[u8; 2]) -> Option<&'a [u8]> {
         su = &su[len..];
     }
     None
+}
+
+/// The Rock Ridge name: every `NM` entry's text, joined, since a long name
+/// may be split across several (each but the last flagged CONTINUE).
+fn rr_name(mut su: &[u8]) -> Option<String> {
+    let mut name = Vec::new();
+    let mut found = false;
+    while su.len() >= 4 {
+        let len = su[2] as usize;
+        if len < 4 || len > su.len() {
+            break;
+        }
+        if &su[..2] == b"NM" && len >= 5 {
+            let flags = su[4];
+            if flags & 0b110 != 0 {
+                return None; // "." or ".." by flag: not a name
+            }
+            name.extend_from_slice(&su[5..len]);
+            found = true;
+            if flags & 1 == 0 {
+                break;
+            }
+        }
+        su = &su[len..];
+    }
+    (found && !name.is_empty()).then(|| String::from_utf8_lossy(&name).into_owned())
 }
 
 /// Identifiers are padded with spaces by the standard and with NULs by
@@ -520,6 +630,16 @@ mod tests {
             .collect();
         assert_eq!(joliet_name(&raw), "Résumé.txt");
         assert_eq!(plain_name(b"DIR."), "DIR");
+        // A name split across two NM entries, the first flagged CONTINUE,
+        // with another entry between them.
+        let su = [
+            &b"NM\x0a\x01\x01Long "[..],
+            &b"PX\x04\x01"[..],
+            &b"NM\x09\x01\x00Name"[..],
+        ]
+        .concat();
+        assert_eq!(rr_name(&su).as_deref(), Some("Long Name"));
+        assert_eq!(rr_name(b"PX\x04\x01"), None);
         assert_eq!(pad_trim("DEMO_LIVE\0\0\0  "), "DEMO_LIVE");
     }
 

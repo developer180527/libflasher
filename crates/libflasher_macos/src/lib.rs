@@ -407,16 +407,29 @@ mod tests {
     }
 
     /// Extract mode, judged by tools that are not ours: `hdiutil makehybrid`
-    /// builds the ISO (Joliet names), libflasher extracts it into a disk
+    /// builds the ISO — ISO 9660 + Joliet, UDF alone, and the ISO 9660 + UDF
+    /// "bridge" Windows install ISOs use — libflasher extracts it into a disk
     /// image file, and macOS's own GPT and FAT32 code mounts the result.
     /// Needs no root and touches no real drive.
     #[test]
     fn macos_mounts_what_extract_mode_writes() {
+        for (name, flags) in [
+            ("joliet", &["-iso", "-joliet"][..]),
+            ("udf", &["-udf"][..]),
+            ("bridge", &["-iso", "-joliet", "-udf"][..]),
+        ] {
+            extract_and_mount(name, flags);
+        }
+    }
+
+    fn extract_and_mount(name: &str, flags: &[&str]) {
         use libflasher_core::{extract, image, mock::FileDevice, FlashOptions};
         use std::sync::atomic::AtomicBool;
 
-        let dir =
-            std::env::temp_dir().join(format!("libflasher_extract_mac_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "libflasher_extract_mac_{}_{name}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let src = dir.join("src");
         let files: Vec<(&str, Vec<u8>)> = vec![
@@ -424,11 +437,12 @@ mod tests {
             ("boot/grub/grub.cfg", b"set timeout=5\n".to_vec()),
             (
                 "Long File Name With Spaces.txt",
-                b"joliet keeps this".to_vec(),
+                b"long names survive".to_vec(),
             ),
+            ("sources/Ünïcode näme.txt", b"unicode too".to_vec()),
             (
-                "live/filesystem.squashfs",
-                (0..2_000_000u32).map(|i| (i % 249) as u8).collect(),
+                "sources/install.wim",
+                (0..5_000_000u32).map(|i| (i % 249) as u8).collect(),
             ),
         ];
         for (p, data) in &files {
@@ -438,21 +452,16 @@ mod tests {
         }
         let iso = dir.join("test.iso");
         let out = Command::new("hdiutil")
-            .args([
-                "makehybrid",
-                "-iso",
-                "-joliet",
-                "-default-volume-name",
-                "FLASHTEST",
-                "-o",
-            ])
+            .arg("makehybrid")
+            .args(flags)
+            .args(["-default-volume-name", "FLASHTEST", "-o"])
             .arg(&iso)
             .arg(&src)
             .output()
             .unwrap();
         assert!(
             out.status.success(),
-            "makehybrid: {}",
+            "makehybrid {name}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
 
@@ -504,8 +513,16 @@ mod tests {
             let volume =
                 volume.expect("macOS mounted no volume: it did not accept the GPT or the FAT32");
             for (p, data) in &files {
-                let got = std::fs::read(volume.join(p)).unwrap_or_else(|e| panic!("{p}: {e}"));
-                assert!(got == *data, "{p} differs");
+                let got = std::fs::read(volume.join(p)).unwrap_or_else(|e| {
+                    panic!(
+                        "{name}: {p}: {e}; volume holds {:?}",
+                        std::fs::read_dir(volume.join("sources")).map(|d| d
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name())
+                            .collect::<Vec<_>>())
+                    )
+                });
+                assert!(got == *data, "{name}: {p} differs");
             }
         });
         let _ = Command::new("hdiutil").args(["detach", &whole]).output();

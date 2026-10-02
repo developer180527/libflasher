@@ -95,19 +95,30 @@ jobs:
   extract-boots:
     # Extract mode's real test: a UEFI ISO, extracted onto a disk image by
     # libflasher, must boot in QEMU on OVMF (open-source UEFI firmware).
-    # The ISO holds only GRUB, told to print a marker and power off.
+    # The ISO holds only GRUB, told to print a marker and power off. Built
+    # twice: by xorriso (ISO 9660 + Rock Ridge + Joliet, read through ISO
+    # 9660) and by genisoimage with UDF (the Windows-style bridge, read
+    # through UDF).
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        iso: [iso9660, udf]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y grub-efi-amd64-bin grub-common xorriso mtools ovmf qemu-system-x86
+      - run: sudo apt-get update && sudo apt-get install -y grub-efi-amd64-bin grub-common xorriso genisoimage mtools ovmf qemu-system-x86
       - name: build a plain (non-hybrid) UEFI ISO
         run: |
           mkdir -p iso/EFI/BOOT
           printf 'echo FLASHER_BOOT_OK\nhalt\n' > grub.cfg
           grub-mkstandalone -O x86_64-efi -o iso/EFI/BOOT/BOOTX64.EFI "boot/grub/grub.cfg=grub.cfg"
-          xorriso -as mkisofs -R -J -V FLASHERBOOT -o test.iso iso
+          if [ "${{ matrix.iso }}" = udf ]; then
+            genisoimage -quiet -udf -J -R -V FLASHERBOOT -o test.iso iso
+          else
+            xorriso -as mkisofs -R -J -V FLASHERBOOT -o test.iso iso
+          fi
           truncate -s 128M disk.img
       - name: extract it with libflasher
         run: |

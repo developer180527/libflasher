@@ -15,8 +15,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ,
-    FILE_SHARE_WRITE,
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, FILE_FLAG_NO_BUFFERING,
+    FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, StorageDeviceProperty, DISK_GEOMETRY_EX, FSCTL_DISMOUNT_VOLUME,
@@ -26,6 +27,9 @@ use windows_sys::Win32::System::Ioctl::{
 };
 use windows_sys::Win32::System::Power::{
     PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest,
+};
+use windows_sys::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT};
@@ -47,14 +51,14 @@ impl Platform for Windows {
     }
 
     fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let system = system_disk();
+        let system = system_disks()?;
         let mut out = Vec::new();
         for n in 0..MAX_DISKS {
             // Disks that do not exist fail to open; that is the end of nothing.
             let Ok(handle) = open_for_query(&policy::disk_path(n)) else {
                 continue;
             };
-            let Some((facts, model)) = describe(&handle, n, system) else {
+            let Some((facts, model)) = describe(&handle, n, &system) else {
                 continue;
             };
             if !(policy::is_candidate(&facts) || is_test_disk(&facts)) {
@@ -95,7 +99,8 @@ impl Platform for Windows {
         let file = File::options()
             .access_mode(GENERIC_READ | GENERIC_WRITE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_WRITE_THROUGH)
+            // No OS cache, so verification reads the drive, not memory.
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
             .open(&device.path)
             .map_err(permission)?;
         let sector = geometry(&file)
@@ -106,6 +111,7 @@ impl Platform for Windows {
             file,
             size: facts.size,
             sector,
+            bounce: Bounce::new(),
             _locks: locks,
         }))
     }
@@ -166,7 +172,7 @@ fn checked(device: &DeviceInfo) -> Result<(u32, DiskFacts)> {
     };
     let n = policy::disk_number(&device.path).ok_or_else(|| refuse("not a physical drive path"))?;
     let handle = open_for_query(&device.path)?;
-    let (facts, _) = describe(&handle, n, system_disk())
+    let (facts, _) = describe(&handle, n, &system_disks()?)
         .ok_or_else(|| refuse("could not read the drive's details"))?;
     if !(policy::is_candidate(&facts) || is_test_disk(&facts)) {
         return Err(refuse(
@@ -198,7 +204,7 @@ fn open_for_query(path: &str) -> Result<File> {
         .open(path)?)
 }
 
-fn describe(disk: &File, number: u32, system: Option<u32>) -> Option<(DiskFacts, String)> {
+fn describe(disk: &File, number: u32, system: &[u32]) -> Option<(DiskFacts, String)> {
     let query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageDeviceProperty,
         QueryType: PropertyStandardQuery,
@@ -234,7 +240,7 @@ fn describe(disk: &File, number: u32, system: Option<u32>) -> Option<(DiskFacts,
         bus_type: desc.BusType,
         removable_media: desc.RemovableMedia != 0,
         size,
-        is_system: system == Some(number),
+        is_system: system.contains(&number),
     };
     Some((
         facts,
@@ -299,13 +305,90 @@ fn volumes_on(n: u32) -> Vec<String> {
     out
 }
 
-/// The disk holding Windows itself, from the Windows directory's drive letter.
-fn system_disk() -> Option<u32> {
+/// Every disk the running Windows needs: the one holding the Windows
+/// directory (all of them, if that volume spans disks), the one holding the
+/// EFI system partition, and those holding page files.
+///
+/// Fails rather than guessing: without the Windows disk, nothing can be
+/// told apart from it, so nothing is listed or opened. The other two are
+/// added when they can be found; they are on the Windows disk on nearly
+/// every machine anyway.
+fn system_disks() -> Result<Vec<u32>> {
+    let fail = |why: String| Error::Tool {
+        tool: "finding the Windows disk".into(),
+        message: format!("could not tell which disk Windows runs from ({why})"),
+    };
+    let letter = windows_letter().ok_or_else(|| fail("no Windows directory".into()))?;
+    let mut out = disks_of_volume(&format!(r"\\.\{letter}:")).map_err(|e| fail(e.to_string()))?;
+    if out.is_empty() {
+        return Err(fail("its volume reports no disk".into()));
+    }
+    const SETUP: &str = r"SYSTEM\Setup";
+    if let Some(esp) =
+        registry(SETUP, "SystemPartition", RRF_RT_REG_SZ).and_then(|v| v.into_iter().next())
+    {
+        // `\Device\HarddiskVolume1`, reachable through the global namespace.
+        out.extend(disks_of_volume(&format!(r"\\?\GLOBALROOT{esp}")).unwrap_or_default());
+    }
+    const MEMORY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
+    for entry in registry(MEMORY, "ExistingPageFiles", RRF_RT_REG_MULTI_SZ).unwrap_or_default() {
+        if let Some(l) = policy::pagefile_letter(&entry) {
+            out.extend(disks_of_volume(&format!(r"\\.\{l}:")).unwrap_or_default());
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// The drive letter of the Windows directory.
+fn windows_letter() -> Option<char> {
     let mut buf = [0u16; 260];
     let len = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
     let dir = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
-    let letter = dir.chars().next().filter(char::is_ascii_alphabetic)?;
-    disk_of_volume(&format!(r"\\.\{letter}:"))
+    dir.chars().next().filter(char::is_ascii_alphabetic)
+}
+
+/// Every disk a volume lies on.
+fn disks_of_volume(path: &str) -> io::Result<Vec<u32>> {
+    let vol = open_for_query(path).map_err(|e| match e {
+        Error::Io(e) => e,
+        other => io::Error::other(other.to_string()),
+    })?;
+    let mut out = vec![0u8; 8 + 32 * 24];
+    let n = ioctl(&vol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, &[], &mut out)?;
+    Ok(policy::extent_disks(&out[..n]))
+}
+
+/// A string (`RRF_RT_REG_SZ`) or string list (`RRF_RT_REG_MULTI_SZ`) value
+/// under `HKEY_LOCAL_MACHINE`, as its strings.
+fn registry(key: &str, value: &str, kind: u32) -> Option<Vec<String>> {
+    let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 4096];
+    let mut bytes = (buf.len() * 2) as u32;
+    // SAFETY: the names are NUL-terminated; `buf` is valid for `bytes`.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            kind,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    buf.truncate(bytes as usize / 2);
+    Some(
+        buf.split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect(),
+    )
 }
 
 /// One `DeviceIoControl`; returns the bytes written to `out`.
@@ -365,6 +448,9 @@ struct Disk {
     file: File,
     size: u64,
     sector: u32,
+    /// Unbuffered I/O must come from aligned memory; callers' buffers are
+    /// ordinary `Vec`s, so every request is copied through this.
+    bounce: Bounce,
     /// Locked, dismounted volumes; dropping them unlocks, after the disk.
     _locks: Vec<File>,
 }
@@ -379,12 +465,17 @@ impl Drop for Disk {
 
 impl Read for Disk {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buf)
+        let n = buf.len().min(BOUNCE);
+        let got = self.file.read(&mut self.bounce.as_mut()[..n])?;
+        buf[..got].copy_from_slice(&self.bounce.as_mut()[..got]);
+        Ok(got)
     }
 }
 impl Write for Disk {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.file.write(buf)
+        let n = buf.len().min(BOUNCE);
+        self.bounce.as_mut()[..n].copy_from_slice(&buf[..n]);
+        self.file.write(&self.bounce.as_mut()[..n])
     }
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
@@ -406,6 +497,45 @@ impl RawDevice for Disk {
         // FlushFileBuffers: on a physical drive, also flushes its write cache.
         self.file.sync_all()?;
         Ok(())
+    }
+}
+
+/// Bytes per unbuffered request: what the flash pipeline sends at once.
+const BOUNCE: usize = 1 << 20;
+/// Page alignment: more than any storage driver's alignment requirement
+/// (`STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR` masks are at most a sector).
+const ALIGN: usize = 4096;
+
+/// `BOUNCE` bytes of page-aligned memory.
+struct Bounce(std::ptr::NonNull<u8>);
+
+// SAFETY: plain owned memory, used by one `Disk` at a time.
+unsafe impl Send for Bounce {}
+
+impl Bounce {
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(BOUNCE, ALIGN).expect("valid layout")
+    }
+
+    fn new() -> Self {
+        // SAFETY: the layout has a non-zero size.
+        let p = unsafe { std::alloc::alloc_zeroed(Self::layout()) };
+        Bounce(
+            std::ptr::NonNull::new(p)
+                .unwrap_or_else(|| std::alloc::handle_alloc_error(Self::layout())),
+        )
+    }
+
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `BOUNCE` initialized bytes, owned by `self`.
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_ptr(), BOUNCE) }
+    }
+}
+
+impl Drop for Bounce {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { std::alloc::dealloc(self.0.as_ptr(), Self::layout()) };
     }
 }
 
@@ -462,19 +592,17 @@ mod tests {
     #[test]
     fn lists_without_offering_the_system_disk() {
         let devices = Windows.list_devices().unwrap();
-        let system = system_disk().expect("the Windows directory's disk should be known");
+        let system = system_disks().expect("the Windows directory's disk should be known");
+        assert!(!system.is_empty());
         for d in &devices {
-            assert_ne!(
-                policy::disk_number(&d.path),
-                Some(system),
-                "offered the system disk: {d:?}"
-            );
+            let n = policy::disk_number(&d.path).unwrap();
+            assert!(!system.contains(&n), "offered a system disk: {d:?}");
         }
     }
 
     #[test]
     fn refuses_to_open_the_system_disk() {
-        let system = system_disk().expect("system disk");
+        let system = system_disks().expect("system disk")[0];
         let fake = DeviceInfo::new(
             policy::disk_path(system),
             "pretend stick",

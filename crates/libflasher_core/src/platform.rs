@@ -65,6 +65,11 @@ impl DeviceInfo {
 
 /// An open, exclusively-held whole disk.
 ///
+/// "Exclusive" means no volume on it can be mounted while it is open: on
+/// Linux it is opened `O_EXCL`; on Windows every volume on it is locked and
+/// dismounted; on macOS a DiskArbitration approval callback refuses mounts
+/// of it until it is closed.
+///
 /// Reads and writes must be multiples of [`RawDevice::sector_size`] on some
 /// platforms (macOS `/dev/rdisk*`, Windows physical drives); the flash pipeline
 /// guarantees that.

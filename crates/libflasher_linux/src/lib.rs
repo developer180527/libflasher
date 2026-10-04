@@ -7,6 +7,7 @@
 //! Empty on every other OS, so `cargo build --workspace` works everywhere.
 #![cfg(target_os = "linux")]
 
+mod disk;
 pub mod helper;
 mod system;
 mod watch;
@@ -14,6 +15,7 @@ mod watch;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -45,9 +47,10 @@ impl Platform for Linux {
             .join(" ")
             .trim()
             .to_string();
+            let users = disk::users_in(Path::new(SYS), &name);
             let mountpoints = mounts
                 .iter()
-                .filter(|(d, _)| system::is_on_disk(d, &dev))
+                .filter(|(d, _)| on_disk(d, &name, &users))
                 .map(|(_, m)| m.clone())
                 .collect();
             let size = read(&sys.join("size")).parse::<u64>().unwrap_or(0) * 512;
@@ -65,16 +68,28 @@ impl Platform for Linux {
     /// As root, directly; otherwise through `libflasher-helper` (pkexec),
     /// which opens the disk and hands the open file back.
     fn open_device(&self, device: &DeviceInfo) -> Result<Box<dyn RawDevice>> {
-        let (_, sys) = check(device)?;
+        let (name, _) = check(device)?;
         let file = if is_root() {
             open_as_root(device)?
         } else {
             helper::open(&device.path)?
         };
-        let sector = read(&sys.join("queue/logical_block_size"))
-            .parse()
-            .unwrap_or(512);
-        let size = read(&sys.join("size")).parse::<u64>().unwrap_or(0) * 512;
+        // The path was checked, then opened (perhaps by the helper, after a
+        // password prompt): make sure the file is that disk, still listed
+        // as the drive the user picked, and take its geometry from the file
+        // itself rather than from the name.
+        same_node(&file, &device.path, &name)?;
+        let size = (&file).seek(SeekFrom::End(0))?;
+        (&file).seek(SeekFrom::Start(0))?;
+        let now = self.still_listed(device)?;
+        if now.size != size {
+            return Err(Error::Refused {
+                device: device.path.clone(),
+                reason: "the drive changed while it was being opened; refresh the drive list"
+                    .into(),
+            });
+        }
+        let sector = sector_size(&file).unwrap_or(512);
         // Whatever the kernel cached of this disk before is not what is on
         // it now (it may be a different stick at the same name).
         drop_cache(&file)?;
@@ -132,13 +147,38 @@ fn is_root() -> bool {
 /// Open the disk for writing; needs root. Used directly when running as
 /// root, and by the helper.
 pub(crate) fn open_as_root(device: &DeviceInfo) -> Result<File> {
-    prepare(device)?;
+    let (name, _) = prepare(device)?;
     // O_EXCL on a block device fails if anything else still holds it mounted.
-    Ok(File::options()
+    let file = File::options()
         .read(true)
         .write(true)
         .custom_flags(libc::O_EXCL)
-        .open(&device.path)?)
+        .open(&device.path)?;
+    same_node(&file, &device.path, &name)?;
+    Ok(file)
+}
+
+/// Refuse `file` unless it is the block device sysfs calls `name` now:
+/// a path can be reused by another disk between checking it and opening it.
+fn same_node(file: &File, path: &str, name: &str) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = file.metadata()?;
+    let want = disk::dev_number_in(Path::new(SYS), name);
+    if !meta.file_type().is_block_device() || want != Some(system::split_dev(meta.rdev())) {
+        return Err(Error::Refused {
+            device: path.into(),
+            reason: "the drive changed while it was being opened; refresh the drive list".into(),
+        });
+    }
+    Ok(())
+}
+
+/// The logical sector size, from the open device.
+fn sector_size(file: &File) -> Option<u32> {
+    let mut size: libc::c_int = 0;
+    // SAFETY: BLKSSZGET writes one int to the pointer it is given.
+    let r = unsafe { libc::ioctl(file.as_raw_fd(), libc::BLKSSZGET, &mut size) };
+    (r == 0 && size >= 512).then_some(size as u32)
 }
 
 /// Needs `sfdisk` (util-linux) and `mkfs.exfat` (exfatprogs), and root.
@@ -191,8 +231,10 @@ fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
     if !is_root() {
         return Err(Error::Permission("changing a disk needs root".into()));
     }
-    for (dev, mountpoint) in mounts() {
-        if system::is_on_disk(&dev, &device.path) {
+    let users = disk::users_in(Path::new(SYS), &checked.0);
+    // Newest mounts first, so one mounted inside another goes before it.
+    for (dev, mountpoint) in mounts().into_iter().rev() {
+        if on_disk(&dev, &checked.0, &users) {
             let m = CString::new(mountpoint.clone()).map_err(io::Error::other)?;
             if unsafe { libc::umount2(m.as_ptr(), 0) } != 0 {
                 let e = io::Error::last_os_error();
@@ -202,6 +244,24 @@ fn prepare(device: &DeviceInfo) -> Result<(String, std::path::PathBuf)> {
                 });
             }
         }
+    }
+    // Unmounting leaves an open LUKS mapping, an active LVM volume group or
+    // a running RAID holding the disk, and O_EXCL would then fail with a
+    // bare "busy". Say what holds it instead.
+    if !users.holders.is_empty() {
+        let names: Vec<String> = users
+            .holders
+            .iter()
+            .map(|h| disk::holder_label(Path::new(SYS), h))
+            .collect();
+        return Err(Error::Refused {
+            device: device.path.clone(),
+            reason: format!(
+                "it is in use by {} (an encrypted, LVM or RAID volume); close that first, \
+                 for example with `cryptsetup close` or `vgchange -an`",
+                names.join(", ")
+            ),
+        });
     }
     Ok(checked)
 }
@@ -250,17 +310,22 @@ fn is_candidate(name: &str, sys: &Path) -> bool {
     if libflasher_core::conformance::test_disk().as_deref() == Some(&format!("/dev/{name}")) {
         return sys.exists();
     }
-    let virtual_dev = ["loop", "ram", "zram", "dm-", "md", "sr", "nbd"]
-        .iter()
-        .any(|p| name.starts_with(p));
-    if virtual_dev || !sys.exists() {
-        return false;
+    let _ = sys;
+    disk::is_candidate_in(Path::new(SYS), name)
+}
+
+/// The sysfs root.
+const SYS: &str = "/sys";
+
+/// Whether the mount source `source` is on disk `name`: the disk, one of
+/// its partitions, or a LUKS/LVM/RAID device built on them — however the
+/// mount table names it (`/dev/disk/by-uuid/…`, `/dev/mapper/…`).
+fn on_disk(source: &str, name: &str, users: &disk::Users) -> bool {
+    if system::is_on_disk(source, &format!("/dev/{name}")) {
+        return true;
     }
-    let removable = read(&sys.join("removable")) == "1";
-    let usb = fs::canonicalize(sys)
-        .map(|p| p.to_string_lossy().contains("/usb"))
-        .unwrap_or(false);
-    removable || usb || name.starts_with("mmcblk")
+    system::kernel_name(source)
+        .is_some_and(|k| k == name || users.partitions.contains(&k) || users.holders.contains(&k))
 }
 
 /// `(device, mountpoint)` for every mount, octal escapes decoded.

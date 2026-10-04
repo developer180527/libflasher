@@ -53,6 +53,33 @@ pub fn volume_open_path(name: &str) -> String {
     name.strip_suffix('\\').unwrap_or(name).to_string()
 }
 
+/// The disk numbers in a `VOLUME_DISK_EXTENTS` (from
+/// `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`): a count, then 24-byte
+/// `DISK_EXTENT`s from offset 8, each starting with its disk number. A
+/// volume spanning disks (dynamic disks, Storage Spaces) names them all.
+pub fn extent_disks(buf: &[u8]) -> Vec<u32> {
+    let Some(count) = buf.get(..4) else {
+        return Vec::new();
+    };
+    let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
+    let mut out: Vec<u32> = (0..count)
+        .filter_map(|i| buf.get(8 + i * 24..8 + i * 24 + 4))
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The drive letter of a page file as `ExistingPageFiles` lists it:
+/// `\??\C:\pagefile.sys` → `C`.
+pub fn pagefile_letter(entry: &str) -> Option<char> {
+    let path = entry.trim().strip_prefix(r"\??\").unwrap_or(entry.trim());
+    let mut chars = path.chars();
+    let letter = chars.next().filter(char::is_ascii_alphabetic)?;
+    (chars.next() == Some(':')).then(|| letter.to_ascii_uppercase())
+}
+
 pub fn disk_path(number: u32) -> String {
     format!(r"\\.\PhysicalDrive{number}")
 }
@@ -169,6 +196,28 @@ mod tests {
         assert_eq!(s.matches("select disk").count(), 1);
         // The label validator is what keeps quotes out; check it holds.
         assert!(libflasher_core::platform::volume_label("A\"B").is_err());
+    }
+
+    #[test]
+    fn reads_disk_extents() {
+        let mut buf = vec![0u8; 8 + 3 * 24];
+        buf[0] = 3;
+        for (i, disk) in [2u32, 0, 2].iter().enumerate() {
+            buf[8 + i * 24..12 + i * 24].copy_from_slice(&disk.to_le_bytes());
+        }
+        assert_eq!(extent_disks(&buf), [0, 2]);
+        // A count larger than the buffer holds reads only what is there.
+        buf[0] = 9;
+        assert_eq!(extent_disks(&buf), [0, 2]);
+        assert!(extent_disks(&[1, 0]).is_empty());
+    }
+
+    #[test]
+    fn page_file_letters() {
+        assert_eq!(pagefile_letter(r"\??\C:\pagefile.sys"), Some('C'));
+        assert_eq!(pagefile_letter(r"d:\pagefile.sys"), Some('D'));
+        assert_eq!(pagefile_letter(r"\??\Volume{x}\pagefile.sys"), None);
+        assert_eq!(pagefile_letter(""), None);
     }
 
     #[test]

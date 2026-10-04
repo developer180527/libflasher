@@ -16,6 +16,7 @@ use libflasher_core::{DeviceInfo, Error, Platform, RawDevice, Result};
 use plist::{Dictionary, Value};
 
 mod authopen;
+mod claim;
 mod watch;
 
 pub struct MacOs;
@@ -76,16 +77,27 @@ impl Platform for MacOs {
         let size = integer(&info, "TotalSize").unwrap_or(0);
         let sector = integer(&info, "DeviceBlockSize").unwrap_or(512) as u32;
 
-        run("diskutil", &["unmountDisk", &device.path])?;
-
-        // The raw node bypasses the buffer cache: several times faster than /dev/diskN.
+        // The password prompt first: if the user cancels it, their volumes
+        // stay mounted. The raw node bypasses the buffer cache: several times
+        // faster than /dev/diskN.
         let raw = format!("/dev/r{id}");
         let file = if unsafe { libc::geteuid() } == 0 {
             File::options().read(true).write(true).open(&raw)?
         } else {
             authopen::open_rw(&raw)?
         };
-        Ok(Box::new(Disk { file, size, sector }))
+        run("diskutil", &["unmountDisk", &device.path])?;
+        // Held until the disk is closed: nothing mounts it again meanwhile.
+        let claim = claim::Claim::take(id).map_err(|reason| Error::Refused {
+            device: device.path.clone(),
+            reason,
+        })?;
+        Ok(Box::new(Disk {
+            file,
+            size,
+            sector,
+            _claim: claim,
+        }))
     }
 
     fn eject(&self, device: &DeviceInfo) -> Result<()> {
@@ -239,6 +251,8 @@ struct Disk {
     file: File,
     size: u64,
     sector: u32,
+    /// Released after `file` is closed (fields drop in order).
+    _claim: claim::Claim,
 }
 
 impl Read for Disk {

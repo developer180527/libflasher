@@ -156,7 +156,7 @@ fn containing_mount<'a>(mounts: &'a [(String, String)], file: &str) -> Option<&'
 
 /// `/dev/sda2` → `sda2`; `/dev/mapper/root` → `dm-0` through its symlink.
 /// `None` for sources that are not device nodes (`overlay`, `tmpfs`).
-fn kernel_name(source: &str) -> Option<String> {
+pub(crate) fn kernel_name(source: &str) -> Option<String> {
     if !source.starts_with("/dev/") {
         return None;
     }
@@ -214,7 +214,7 @@ pub(crate) fn unescape(s: &str) -> String {
 }
 
 /// glibc's `major()`/`minor()` of a `dev_t`.
-fn split_dev(dev: u64) -> (u32, u32) {
+pub(crate) fn split_dev(dev: u64) -> (u32, u32) {
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
     let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
     (major as u32, minor as u32)

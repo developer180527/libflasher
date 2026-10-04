@@ -13,9 +13,15 @@
 //! is what matters, and it needs no privilege.
 //!
 //! Like `watch.rs`, the session lives on a thread running its own run loop.
+//!
+//! A session's callbacks are live only once diskarbitrationd has taken the
+//! session in, which happens asynchronously and takes longer on a loaded
+//! machine. It then reports every disk present to the session's "appeared"
+//! callback, so hearing about our own disk is the sign the refusal is in
+//! place; [`Claim::take`] returns only after that.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -28,9 +34,12 @@ type CFRunLoopRef = *mut c_void;
 type DAReturn = i32;
 
 type ApprovalCallback = extern "C" fn(disk: DADiskRef, context: *mut c_void) -> DADissenterRef;
+type DiskCallback = extern "C" fn(disk: DADiskRef, context: *mut c_void);
 
 /// `kDAReturnExclusiveAccess`: "the disk is in exclusive use".
 const EXCLUSIVE_ACCESS: DAReturn = 0xF8DA_0004_u32 as i32;
+/// How long diskarbitrationd has to take the session in.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[link(name = "DiskArbitration", kind = "framework")]
 extern "C" {
@@ -42,6 +51,13 @@ extern "C" {
         callback: ApprovalCallback,
         context: *mut c_void,
     );
+    fn DARegisterDiskAppearedCallback(
+        session: DASessionRef,
+        matching: CFTypeRef,
+        callback: DiskCallback,
+        context: *mut c_void,
+    );
+    fn DAUnregisterCallback(session: DASessionRef, callback: *mut c_void, context: *mut c_void);
     fn DAUnregisterApprovalCallback(
         session: DASessionRef,
         callback: *mut c_void,
@@ -79,66 +95,107 @@ fn is_on(name: &str, whole: &str) -> bool {
     })
 }
 
+/// What the callbacks share with the claim: the disk, whether
+/// DiskArbitration has reported it to this session, and how many mounts of
+/// it were refused.
+struct Shared {
+    whole: CString,
+    seen: AtomicBool,
+    refused: AtomicUsize,
+}
+
+impl Shared {
+    /// Whether `disk` is ours: the whole disk or one of its partitions.
+    fn ours(&self, disk: DADiskRef) -> bool {
+        // SAFETY: DiskArbitration hands us a valid disk; its BSD name, when
+        // there is one, is a C string it owns for the call.
+        let name = unsafe { DADiskGetBSDName(disk) };
+        if name.is_null() {
+            return false;
+        }
+        let name = unsafe { CStr::from_ptr(name) };
+        matches!((name.to_str(), self.whole.to_str()), (Ok(n), Ok(w)) if is_on(n, w))
+    }
+}
+
 extern "C" fn refuse_mount(disk: DADiskRef, context: *mut c_void) -> DADissenterRef {
-    // SAFETY: `context` is the claim thread's `CString`, alive while the
-    // callback is registered; DiskArbitration hands us a valid disk.
-    let whole = unsafe { CStr::from_ptr(context as *const c_char) };
-    let name = unsafe { DADiskGetBSDName(disk) };
-    if name.is_null() {
+    // SAFETY: `context` is the claim's `Shared`, alive while registered.
+    let shared = unsafe { &*(context as *const Shared) };
+    if !shared.ours(disk) {
         return std::ptr::null_mut();
     }
-    let name = unsafe { CStr::from_ptr(name) };
-    match (name.to_str(), whole.to_str()) {
-        // DiskArbitration releases the dissenter it is given.
-        (Ok(n), Ok(w)) if is_on(n, w) => unsafe {
-            DADissenterCreate(std::ptr::null(), EXCLUSIVE_ACCESS, std::ptr::null())
-        },
-        _ => std::ptr::null_mut(),
+    shared.refused.fetch_add(1, Ordering::Relaxed);
+    // DiskArbitration releases the dissenter it is given.
+    unsafe { DADissenterCreate(std::ptr::null(), EXCLUSIVE_ACCESS, std::ptr::null()) }
+}
+
+extern "C" fn appeared(disk: DADiskRef, context: *mut c_void) {
+    // SAFETY: as in `refuse_mount`.
+    let shared = unsafe { &*(context as *const Shared) };
+    if shared.ours(disk) {
+        shared.seen.store(true, Ordering::Relaxed);
     }
 }
 
 /// The disk is held until this is dropped.
 pub struct Claim {
     stop: Arc<AtomicBool>,
+    /// For tests, which ask how many mounts were refused.
+    #[cfg(test)]
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Claim {
     /// Refuse mounts of the whole disk `bsd_name` (`disk4`) and its
-    /// partitions until dropped. `Err` if DiskArbitration is unavailable.
+    /// partitions until dropped. Returns once the refusal is in place; `Err`
+    /// if DiskArbitration is unavailable or never reports the disk.
     pub fn take(bsd_name: &str) -> Result<Self, String> {
-        let name = CString::new(bsd_name).map_err(|e| e.to_string())?;
+        let shared = Arc::new(Shared {
+            whole: CString::new(bsd_name).map_err(|e| e.to_string())?,
+            seen: AtomicBool::new(false),
+            refused: AtomicUsize::new(0),
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let ours = shared.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("libflasher-claim".into())
             .spawn(move || {
                 // SAFETY: CoreFoundation/DiskArbitration calls on this
-                // thread's own run loop. `name` outlives the callback, which
-                // is unregistered before it is dropped.
+                // thread's own run loop. `ours` outlives both callbacks,
+                // which are unregistered before it is dropped.
                 unsafe {
                     let session = DASessionCreate(std::ptr::null());
                     if session.is_null() {
                         let _ = ready_tx.send(Err("no DiskArbitration session".into()));
                         return;
                     }
-                    let context = name.as_ptr() as *mut c_void;
+                    let context = Arc::as_ptr(&ours) as *mut c_void;
                     DARegisterDiskMountApprovalCallback(
                         session,
                         std::ptr::null(),
                         refuse_mount,
                         context,
                     );
+                    DARegisterDiskAppearedCallback(session, std::ptr::null(), appeared, context);
                     let run_loop = CFRunLoopGetCurrent();
                     DASessionScheduleWithRunLoop(session, run_loop, kCFRunLoopDefaultMode);
-                    // Let the session register with diskarbitrationd before
-                    // saying it is in place.
-                    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.2, 0);
-                    let _ = ready_tx.send(Ok(()));
-                    while !flag.load(Ordering::Relaxed) {
+                    let end = std::time::Instant::now() + READY_TIMEOUT;
+                    while !ours.seen.load(Ordering::Relaxed) && std::time::Instant::now() < end {
+                        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, 1);
+                    }
+                    let ready = ours.seen.load(Ordering::Relaxed);
+                    let _ = ready_tx.send(if ready {
+                        Ok(())
+                    } else {
+                        Err("macOS did not report the drive; it may have been unplugged".into())
+                    });
+                    while ready && !flag.load(Ordering::Relaxed) {
                         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, 0);
                     }
+                    DAUnregisterCallback(session, appeared as *mut c_void, context);
                     DAUnregisterApprovalCallback(session, refuse_mount as *mut c_void, context);
                     DASessionUnscheduleFromRunLoop(session, run_loop, kCFRunLoopDefaultMode);
                     CFRelease(session as CFTypeRef);
@@ -148,6 +205,8 @@ impl Claim {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 stop,
+                #[cfg(test)]
+                shared,
                 thread: Some(thread),
             }),
             Ok(Err(e)) => {
@@ -159,6 +218,12 @@ impl Claim {
                 Err("the claim thread stopped".into())
             }
         }
+    }
+
+    /// How many mounts of the disk have been refused so far.
+    #[cfg(test)]
+    fn refused(&self) -> usize {
+        self.shared.refused.load(Ordering::Relaxed)
     }
 }
 
@@ -246,23 +311,15 @@ mod tests {
         };
         let result = std::panic::catch_unwind(|| {
             let claim = Claim::take(&bsd).expect("claim");
-            if mount() {
-                // CI (macOS 26, a headless runner) mounts it anyway; a
-                // desktop session on macOS 27 does not. Whether the
-                // difference is the version or the session is not known yet,
-                // so outside a desktop session this records what happened
-                // rather than failing.
-                let session = command_text("launchctl", &["managername"]);
-                let version = command_text("sw_vers", &["-productVersion"]);
-                assert_ne!(
-                    session, "Aqua",
-                    "mounted while held, in a desktop session (macOS {version})"
-                );
-                eprintln!(
-                    "NOTE: mount refusal not honoured here (macOS {version}, {session} session)"
-                );
-                return;
-            }
+            let mounted = mount();
+            assert!(
+                !mounted,
+                "mounted while held (macOS {}, {} session); the refusal was asked {} times",
+                command_text("sw_vers", &["-productVersion"]),
+                command_text("launchctl", &["managername"]),
+                claim.refused()
+            );
+            assert!(claim.refused() > 0, "refused without being asked");
             drop(claim);
             assert!(mount(), "not mountable once released");
         });

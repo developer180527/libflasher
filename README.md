@@ -42,11 +42,11 @@ file-backed mock drives, so it needs no hardware.
 
 | | |
 |---|---|
-| Images | Disk image / hybrid ISO / plain ISO detected from content, not name. gzip, xz, zstd, bzip2. An `.xz`'s exact size is read from its index, so progress is exact and a too-small drive is refused before writing. |
+| Images | Disk image / hybrid ISO / plain ISO detected from content, not name. gzip, xz, zstd, bzip2, and `.zip` holding one image (stored or deflate, ZIP64, CRC-32 checked). An `.xz`'s or `.zip`'s exact size is read from its index, so progress is exact and a too-small drive is refused before writing. A file of unknown kind is written as asked, and front ends are told to warn. |
 | Filesystems read | ISO 9660 with Rock Ridge and Joliet (continuation areas, split names); UDF 1.02–2.01 (Windows ISOs). |
-| Checksums | SHA-256 of the download, checked before the drive is touched; found automatically in `SHA256SUMS` / `<image>.sha256` next to it. |
-| Safety | Only removable disks are listed. The disks the running system is on never are, however they are attached, and are refused if named: macOS follows `/` to its APFS physical stores (a Mac started from an external SSD); Linux follows the system mounts and swap through partitions, LVM/LUKS/RAID and loop devices (a live USB, `/dev/root`). A drive is re-checked (model, size, bus) before opening, because device paths are reused after unplugging. |
-| Faults | 1 MiB requests, a flush every 32 MiB; a request over 20 s is a stall and nothing more is sent; an unplugged drive is reported as such, mid-write or mid-verify. |
+| Checksums | SHA-256 of the download, checked before the drive is touched; found automatically in `SHA256SUMS` / `<image>.sha256` next to it. A checksum file from beside the image proves the download is intact, not that it is genuine; the API says which kind of file it was so front ends can say so. |
+| Safety | Only removable disks are listed. The disks the running system is on never are, however they are attached, and are refused if named: macOS follows `/` to its APFS physical stores (a Mac started from an external SSD); Linux follows the system mounts and swap through partitions, LVM/LUKS/RAID and loop devices (a live USB, `/dev/root`); Windows takes the Windows volume's disks, the EFI partition's and the page files', and lists nothing if it cannot tell. Linux offers SD cards but never soldered-in eMMC, its boot partitions or empty card slots. A drive is re-checked (model, size, bus) before opening, because device paths are reused after unplugging; on Linux the opened file is also checked to be that disk. While a disk is open nothing can mount it: Linux opens it `O_EXCL` and names any LUKS/LVM/RAID volume still holding it, Windows locks every volume (retrying for 5 s while Explorer or a scanner lets go), macOS refuses mounts through DiskArbitration. |
+| Faults | 1 MiB requests, a flush every 32 MiB; a request over 20 s is a stall and nothing more is sent; an unplugged drive is reported as such, mid-write, mid-flush or mid-verify. Verification reads the drive, never an OS cache (Linux drops it, Windows writes unbuffered). Extract mode checks every file's contents and length. |
 | Progress | Speed and time left over a sliding window, labelled when estimated (`rate::StatusLine`, the same words in every front end). |
 | Platform services | Hot-plug notifications, keep-awake, eject, restore a flashed drive to plain exFAT. |
 
@@ -56,7 +56,7 @@ file-backed mock drives, so it needs no hardware.
 libflasher                the crate apps depend on: re-exports everything below,
 │                         plus current_platform() and, on Linux, linux_helper
 ├── libflasher_core       OS-independent; never opens a device itself
-│   ├── image             what an image is; decompressing reader; xz index size
+│   ├── image, zip        what an image is; decompressing reader; xz index, zip directory
 │   ├── flash             raw write → flush → verify; the write_image dispatcher
 │   ├── extract           plan + extract over "items": dirs, files, generated .swm parts
 │   ├── iso9660, udf      read-only filesystem readers, bounded against hostile input
@@ -85,20 +85,26 @@ neither breaks existing users.
 **Privilege** never extends to a whole program on macOS or Linux: the OS opens
 the disk with the user's consent (`authopen`, or `pkexec libflasher-helper`)
 and passes the open file descriptor back, and writing happens unprivileged.
-Windows has no such mechanism, so the app runs elevated.
+That descriptor is close-on-exec, so no program started meanwhile inherits
+it. Windows has no such mechanism, so the app runs elevated; the one script
+it hands an elevated tool (`diskpart`) is created fresh in `Windows\Temp` and
+locked until it has been read.
 
-**Untrusted input.** ISO, UDF and WIM structures come from downloaded files;
-every size, depth, count and offset read from them is bounded or checked
-before use, and a malformed image is an error, never a hang or a panic.
+**Untrusted input.** ISO, UDF, WIM and zip structures come from downloaded
+files; every size, depth, count and offset read from them is bounded or
+checked before use, as is the total work (a directory reached from two
+parents is refused), and a malformed image is an error, never a hang or a
+panic. A mutation test holds this: 120,000 seeded, damaged images per run.
 
 ## How it is tested
 
 | Layer | What | Where |
 |---|---|---|
 | Unit | Every module, including hostile-input bounds, injected faults (stall, unplug, corruption), GPT CRCs, WIM split invariants | every OS, every push |
+| **Mutation** | Valid ISO 9660, Rock Ridge, UDF, WIM and zip images, damaged 120,000 seeded ways, read as extract mode would: no panic, nothing over 2 s | every OS, every push |
 | Backends, read-only | Real disks on each runner: listing, refusing the system disk, keep-awake, hot-plug (attach and detach a virtual disk) | macOS, Linux, Windows |
 | **Conformance** | List → open → flash → verify → restore through the real backend, on a throwaway virtual disk (loop device, `hdiutil` image, VHD). Linux runs it twice: as root, and unprivileged through the helper. Refuses any disk over 512 MiB. | macOS, Linux, Windows |
-| Independent tools | Apple's `hdiutil` builds Joliet, UDF and bridge ISOs; libflasher extracts them; **macOS mounts the result** and every file is compared. **wimlib** verifies and applies our `.swm` split sets. | macOS tests; CI `wim-split` |
+| Independent tools | Apple's `hdiutil` builds Joliet, UDF and bridge ISOs; libflasher extracts them; **macOS mounts the result** and every file is compared. **wimlib** verifies and applies our `.swm` split sets. Info-ZIP `zip` and macOS `ditto` make the zips read back. | macOS tests; CI `wim-split` |
 | **Boot** | A GRUB UEFI ISO (built by `xorriso`, and by `genisoimage` with UDF) is extracted, then **booted in QEMU on OVMF** | CI `extract-boots` |
 
 Real hardware so far: a Raspberry Pi image and an Ubuntu ISO written and
@@ -106,7 +112,7 @@ verified to a USB-C stick on macOS. Nothing else has touched a physical drive.
 
 ## State
 
-Done: everything above. About 7,900 lines; 52 tests and 9 CI jobs, all green.
+Done: everything above. About 11,100 lines; 115 tests and 10 CI jobs.
 
 **Known gaps**, most important first:
 
@@ -119,6 +125,14 @@ Done: everything above. About 7,900 lines; 52 tests and 9 CI jobs, all green.
 - Extracted Linux ISOs that find their files by volume label (Fedora's) may
   not boot, as FAT labels are 11 characters. Those ISOs are hybrid, so they
   take the raw path anyway.
+- **Signatures.** Checksums are checked; signatures (`SHA256SUMS.gpg`,
+  minisign) are not. That needs an OpenPGP verifier and a store of trusted
+  keys, and will be its own piece of work.
+- **macOS 26 mount refusal** is proven on macOS 27; on CI's macOS 26 runner a
+  mount got through once, before the refusal waited to be in place. Check it
+  on a macOS 26 desktop.
+- Extract mode makes one FAT32 partition of at most 2 TiB (FAT32's limit with
+  512-byte sectors); the rest of a larger disk is left unpartitioned.
 - Ejecting is a no-op on Linux (needs UDisks2 power-off).
 - A Linux root on a multi-device btrfs or a ZFS pool is traced to one disk at most; such roots on USB disks are rare, and a mounted disk is refused when opened anyway.
 - Not yet on crates.io. The API is frozen at 0.1 but has had no outside users.

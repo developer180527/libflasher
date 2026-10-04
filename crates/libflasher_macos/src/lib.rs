@@ -33,43 +33,7 @@ impl Platform for MacOs {
         let list = with_test_disk(list)?;
         // A Mac started from an external drive lists it as external.
         let system = system_disks()?;
-        let mut out = Vec::new();
-        for entry in array(&list, "AllDisksAndPartitions") {
-            let Some(d) = entry.as_dictionary() else {
-                continue;
-            };
-            let Some(id) = string(d, "DeviceIdentifier") else {
-                continue;
-            };
-            if system.contains(&id) {
-                continue;
-            }
-            let info = disk_info(&id)?;
-            if bool(&info, "Internal") {
-                continue;
-            }
-            let mut mountpoints: Vec<String> = string(d, "MountPoint").into_iter().collect();
-            for p in d
-                .get("Partitions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(m) = p.as_dictionary().and_then(|p| string(p, "MountPoint")) {
-                    mountpoints.push(m);
-                }
-            }
-            out.push(DeviceInfo::new(
-                format!("/dev/{id}"),
-                string(&info, "MediaName").unwrap_or_default().trim(),
-                integer(&info, "TotalSize")
-                    .or_else(|| integer(&info, "Size"))
-                    .unwrap_or(0),
-                string(&info, "BusProtocol").unwrap_or_default(),
-                mountpoints,
-            ));
-        }
-        Ok(out)
+        Ok(devices_in(&list, &system, disk_info))
     }
 
     fn open_device(&self, device: &DeviceInfo) -> Result<Box<dyn RawDevice>> {
@@ -134,6 +98,57 @@ impl Platform for MacOs {
         )
         .map(|_| ())
     }
+}
+
+/// The disks to offer from a `diskutil list -plist` result, given the
+/// system's disks and a way to look one up. A disk whose lookup fails is
+/// left out, not the whole list: one unplugged mid-listing (exactly when a
+/// hot-plug notification asks for a new list) would otherwise make every
+/// other drive disappear too.
+fn devices_in(
+    list: &Value,
+    system: &[String],
+    disk_info: impl Fn(&str) -> Result<Dictionary>,
+) -> Vec<DeviceInfo> {
+    let mut out = Vec::new();
+    for entry in array(list, "AllDisksAndPartitions") {
+        let Some(d) = entry.as_dictionary() else {
+            continue;
+        };
+        let Some(id) = string(d, "DeviceIdentifier") else {
+            continue;
+        };
+        if system.contains(&id) {
+            continue;
+        }
+        let Ok(info) = disk_info(&id) else {
+            continue;
+        };
+        if bool(&info, "Internal") {
+            continue;
+        }
+        let mut mountpoints: Vec<String> = string(d, "MountPoint").into_iter().collect();
+        for p in d
+            .get("Partitions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(m) = p.as_dictionary().and_then(|p| string(p, "MountPoint")) {
+                mountpoints.push(m);
+            }
+        }
+        out.push(DeviceInfo::new(
+            format!("/dev/{id}"),
+            string(&info, "MediaName").unwrap_or_default().trim(),
+            integer(&info, "TotalSize")
+                .or_else(|| integer(&info, "Size"))
+                .unwrap_or(0),
+            string(&info, "BusProtocol").unwrap_or_default(),
+            mountpoints,
+        ));
+    }
+    out
 }
 
 #[cfg(feature = "test-virtual-disks")]
@@ -367,6 +382,40 @@ fn bool(d: &Dictionary, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One disk gone between `diskutil list` and `diskutil info`: the rest
+    /// are still listed. The system disk never is.
+    #[test]
+    fn a_disk_vanishing_mid_listing_leaves_the_others() {
+        let list = Value::from_reader_xml(
+            br#"<plist version="1.0"><dict><key>AllDisksAndPartitions</key><array>
+                <dict><key>DeviceIdentifier</key><string>disk4</string></dict>
+                <dict><key>DeviceIdentifier</key><string>disk5</string></dict>
+                <dict><key>DeviceIdentifier</key><string>disk6</string>
+                    <key>Partitions</key><array>
+                        <dict><key>MountPoint</key><string>/Volumes/STICK</string></dict>
+                    </array></dict>
+                <dict><key>DeviceIdentifier</key><string>disk7</string></dict>
+            </array></dict></plist>"# as &[u8],
+        )
+        .unwrap();
+        let info = |id: &str| -> Result<Dictionary> {
+            match id {
+                "disk5" => Err(tool_err("diskutil", "Could not find disk: disk5")),
+                _ => {
+                    let mut d = Dictionary::new();
+                    d.insert("MediaName".into(), Value::String(format!("Stick {id}")));
+                    d.insert("TotalSize".into(), Value::Integer(8_000_000_000u64.into()));
+                    d.insert("BusProtocol".into(), Value::String("USB".into()));
+                    Ok(d)
+                }
+            }
+        };
+        let got = devices_in(&list, &["disk7".to_string()], info);
+        let paths: Vec<&str> = got.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["/dev/disk4", "/dev/disk6"]);
+        assert_eq!(got[1].mountpoints, ["/Volumes/STICK"]);
+    }
 
     #[test]
     fn whole_disk_ids() {

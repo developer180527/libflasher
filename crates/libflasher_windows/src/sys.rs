@@ -90,8 +90,13 @@ impl Platform for Windows {
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .open(&path)
                 .map_err(permission)?;
-            ioctl(&vol, FSCTL_LOCK_VOLUME, &[], &mut [])
-                .map_err(|e| tool(&format!("locking volume {path}"), e))?;
+            policy::retry(policy::LOCK_TRIES, policy::LOCK_WAIT, || {
+                ioctl(&vol, FSCTL_LOCK_VOLUME, &[], &mut [])
+            })
+            .map_err(|e| Error::Refused {
+                device: device.path.clone(),
+                reason: format!("{} ({e})", policy::busy_message(&letters_on(n))),
+            })?;
             ioctl(&vol, FSCTL_DISMOUNT_VOLUME, &[], &mut [])
                 .map_err(|e| tool(&format!("dismounting volume {path}"), e))?;
             locks.push(vol);

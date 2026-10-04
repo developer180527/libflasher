@@ -171,7 +171,7 @@ impl<'a> BlockIo<'a> {
         self.since_sync += written;
         if self.since_sync >= self.sync_every {
             self.since_sync = 0;
-            self.timed(|d| d.sync().map_err(io::Error::other))?;
+            self.timed(|d| d.sync().map_err(into_io))?;
         }
         Ok(())
     }
@@ -184,7 +184,7 @@ impl<'a> BlockIo<'a> {
             self.write_back(i)?;
         }
         self.since_sync = 0;
-        self.timed(|d| d.sync().map_err(io::Error::other))
+        self.timed(|d| d.sync().map_err(into_io))
     }
 
     /// Forget everything cached (after `sync`), so later reads come from
@@ -192,6 +192,15 @@ impl<'a> BlockIo<'a> {
     pub fn drop_cache(&mut self) {
         self.blocks.clear();
         self.order.clear();
+    }
+}
+
+/// A device's error as the `io::Error` it was, so the OS error code
+/// survives — an unplugged drive is then still named as one.
+fn into_io(e: crate::Error) -> io::Error {
+    match e {
+        crate::Error::Io(e) => e,
+        other => io::Error::other(other),
     }
 }
 
@@ -305,6 +314,55 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         assert!(raw[..1 << 20].iter().all(|&b| b == 0x5A));
         assert!(raw[3 << 20..].iter().all(|&b| b == 0x5A));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A drive unplugged during a flush is reported as unplugged.
+    #[test]
+    fn a_failed_flush_keeps_its_os_error() {
+        struct Gone(FileDevice);
+        impl Read for Gone {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                self.0.read(b)
+            }
+        }
+        impl Write for Gone {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.write(b)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for Gone {
+            fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+                self.0.seek(p)
+            }
+        }
+        impl RawDevice for Gone {
+            fn sector_size(&self) -> u32 {
+                512
+            }
+            fn size(&self) -> u64 {
+                self.0.size()
+            }
+            fn sync(&mut self) -> crate::Result<()> {
+                Err(crate::mock::device_gone_for_tests().into())
+            }
+        }
+        // Its own size: temp files are named by size, and tests run at once.
+        let (path, dev) = device(3 << 20);
+        let mut gone = Gone(dev);
+        let mut io = BlockIo::new(&mut gone, 0, 1 << 20, Duration::from_secs(20), 1 << 20);
+        io.write_all(&[1; 4096]).unwrap();
+        let e = io.sync().unwrap_err();
+        assert!(
+            matches!(
+                crate::Error::Io(e).at_device(0),
+                crate::Error::DeviceGone { .. }
+            ),
+            "an unplugged drive was not reported as one"
+        );
         std::fs::remove_file(path).ok();
     }
 

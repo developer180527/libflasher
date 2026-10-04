@@ -17,6 +17,10 @@ const SECTOR: u64 = 2048;
 const MAX_DIR_BYTES: u64 = 16 << 20;
 const MAX_DEPTH: usize = 64;
 const MAX_ENTRIES: usize = 1_000_000;
+/// Directory bytes one walk may read in all. Entries are capped by count;
+/// this caps the work, which directories shared between parents would
+/// otherwise multiply.
+pub(crate) const MAX_TOTAL_DIR_BYTES: u64 = 256 << 20;
 
 /// One file or directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +203,9 @@ impl<R: Read + Seek> Iso<R> {
             }
         }
         let primary = primary.ok_or_else(|| bad("no primary volume descriptor"))?;
+        if primary.1 == 0 {
+            return Err(bad("empty root directory"));
+        }
         let mut iso = Iso {
             r,
             root: primary,
@@ -226,7 +233,10 @@ impl<R: Read + Seek> Iso<R> {
     /// record (SUSP), and names files with `NM`.
     fn has_rock_ridge(&mut self) -> io::Result<bool> {
         let data = self.read_extent(self.root.0, self.root.1.min(SECTOR))?;
-        let len = data[0] as usize;
+        let Some(&len) = data.first() else {
+            return Ok(false);
+        };
+        let len = len as usize;
         if len < 34 || len > data.len() {
             return Ok(false);
         }
@@ -275,9 +285,19 @@ impl<R: Read + Seek> Iso<R> {
     pub fn walk(&mut self) -> io::Result<Vec<Entry>> {
         let mut out = Vec::new();
         let mut stack = vec![(String::new(), self.root, 0usize)];
+        // A real image reaches each directory from one parent only.
+        let mut seen = std::collections::HashSet::new();
+        let mut read = 0u64;
         while let Some((prefix, (off, len), depth)) = stack.pop() {
             if depth > MAX_DEPTH {
                 return Err(bad("directories nested too deep"));
+            }
+            if !seen.insert(off) {
+                return Err(bad(format!("directory {prefix:?} reached twice")));
+            }
+            read += len;
+            if read > MAX_TOTAL_DIR_BYTES {
+                return Err(bad("directories too large in total"));
             }
             for e in self.read_dir(&prefix, off, len)? {
                 if out.len() >= MAX_ENTRIES {
@@ -609,6 +629,55 @@ mod tests {
 
     use super::build::{iso, File};
     use super::*;
+
+    /// The root directory record in the primary volume descriptor.
+    const ROOT_RECORD: usize = 16 * SECTOR as usize + 156;
+
+    /// A root of length 0 used to index an empty buffer: an error now.
+    #[test]
+    fn refuses_an_empty_root_directory() {
+        for rr in [false, true] {
+            let mut img = iso("X", &files(), rr);
+            img[ROOT_RECORD + 10..ROOT_RECORD + 14].fill(0);
+            img[ROOT_RECORD + 14..ROOT_RECORD + 18].fill(0);
+            assert!(Iso::open(Cursor::new(img)).is_err(), "rock ridge {rr}");
+        }
+    }
+
+    /// Two directories pointing at one extent: refused, not walked twice.
+    #[test]
+    fn refuses_a_directory_reached_twice() {
+        let fs_ = vec![
+            File {
+                path: "AAA/one.txt",
+                data: b"1".to_vec(),
+            },
+            File {
+                path: "BBB/two.txt",
+                data: b"2".to_vec(),
+            },
+        ];
+        let mut img = iso("X", &fs_, false);
+        // Point BBB's record in the root at AAA's extent.
+        let root = le32(&img[ROOT_RECORD + 2..]) as usize * SECTOR as usize;
+        let find = |img: &[u8], name: &[u8]| {
+            let mut pos = root;
+            loop {
+                let len = img[pos] as usize;
+                assert!(len > 0, "{name:?} not in the root");
+                let n = img[pos + 32] as usize;
+                if &img[pos + 33..pos + 33 + n] == name {
+                    return pos;
+                }
+                pos += len;
+            }
+        };
+        let (a, b) = (find(&img, b"AAA"), find(&img, b"BBB"));
+        let extent = img[a + 2..a + 18].to_vec();
+        img[b + 2..b + 18].copy_from_slice(&extent);
+        let e = Iso::open(Cursor::new(img)).unwrap().walk().unwrap_err();
+        assert!(e.to_string().contains("reached twice"), "{e}");
+    }
 
     fn files() -> Vec<File<'static>> {
         vec![

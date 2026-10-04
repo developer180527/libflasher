@@ -10,7 +10,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::iso9660::{read_extents, Entry, HOLE};
+use crate::iso9660::{read_extents, Entry, HOLE, MAX_TOTAL_DIR_BYTES};
 
 const SECTOR: u64 = 2048;
 const MAX_DIR_BYTES: u64 = 16 << 20;
@@ -137,6 +137,10 @@ impl<R: Read + Seek> Udf<R> {
                 io::ErrorKind::Unsupported,
                 "UDF with a metadata or virtual partition (UDF 2.50 / rewritable media) is not supported",
             ));
+        }
+        // A type 1 map is 6 bytes: type, length, volume sequence, partition.
+        if maps.len() < 6 || maps[1] != 6 {
+            return Err(bad("partition map too short"));
         }
         let number = u16le(maps, 4);
         let partition = partitions
@@ -270,9 +274,15 @@ impl<R: Read + Seek> Udf<R> {
     pub fn walk(&mut self) -> io::Result<Vec<Entry>> {
         let mut out = Vec::new();
         let mut stack = vec![(String::new(), self.root, 0usize)];
+        // A real image reaches each directory from one parent only.
+        let mut seen = std::collections::HashSet::new();
+        let mut read = 0u64;
         while let Some((prefix, lbn, depth)) = stack.pop() {
             if depth > MAX_DEPTH {
                 return Err(bad("directories nested too deep"));
+            }
+            if !seen.insert(lbn) {
+                return Err(bad(format!("directory {prefix:?} reached twice")));
             }
             let FileData {
                 is_dir,
@@ -284,6 +294,10 @@ impl<R: Read + Seek> Udf<R> {
             }
             if size > MAX_DIR_BYTES {
                 return Err(bad(format!("directory of {size} bytes")));
+            }
+            read += size;
+            if read > MAX_TOTAL_DIR_BYTES {
+                return Err(bad("directories too large in total"));
             }
             let mut data = Vec::with_capacity(size as usize);
             read_extents(
@@ -394,9 +408,145 @@ fn dstring(field: &[u8]) -> String {
         .to_string()
 }
 
+/// A tiny UDF writer, for tests: enough structure for [`Udf::open`] and
+/// [`Udf::walk`], with knobs for building the malformed images they must
+/// refuse.
+#[cfg(test)]
+pub(crate) mod build {
+    use super::{tag, SECTOR};
+
+    /// Where the partition starts, in sectors.
+    const PARTITION: u32 = 300;
+
+    pub enum Node {
+        /// Children: a name and the index of the node it names.
+        Dir(Vec<(&'static str, usize)>),
+        /// At most one block of data.
+        File(Vec<u8>),
+    }
+
+    fn tagged(b: &mut [u8], id: u16) {
+        b[0..2].copy_from_slice(&id.to_le_bytes());
+        b[4] = 0;
+        b[4] = b[..16].iter().fold(0u8, |a, &x| a.wrapping_add(x));
+    }
+
+    /// An image whose root is `nodes[0]`. Node `i` has its file entry at
+    /// partition block `1 + 2i` and its data at `2 + 2i`. `map_len` is the
+    /// partition map length the logical volume descriptor claims (6 is right).
+    pub fn udf(nodes: &[Node], map_len: u8) -> Vec<u8> {
+        let blocks = PARTITION as usize + 2 + 2 * nodes.len();
+        let mut img = vec![0u8; blocks * SECTOR as usize];
+        let sector = |n: usize| n * SECTOR as usize;
+        for (i, id) in [b"BEA01", b"NSR02", b"TEA01"].iter().enumerate() {
+            img[sector(16 + i) + 1..sector(16 + i) + 6].copy_from_slice(*id);
+        }
+        // Anchor → volume descriptors at sectors 32.. (16 sectors' worth).
+        let a = sector(256);
+        img[a + 16..a + 20].copy_from_slice(&(16 * SECTOR as u32).to_le_bytes());
+        img[a + 20..a + 24].copy_from_slice(&32u32.to_le_bytes());
+        tagged(&mut img[a..a + 16], tag::ANCHOR);
+        let pd = sector(32);
+        img[pd + 188..pd + 192].copy_from_slice(&PARTITION.to_le_bytes());
+        tagged(&mut img[pd..pd + 16], tag::PARTITION);
+        let lvd = sector(33);
+        img[lvd + 84] = 8;
+        img[lvd + 85..lvd + 89].copy_from_slice(b"TEST");
+        img[lvd + 84 + 127] = 5;
+        img[lvd + 212..lvd + 216].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+        img[lvd + 264..lvd + 268].copy_from_slice(&(map_len as u32).to_le_bytes());
+        img[lvd + 440] = 1;
+        img[lvd + 441] = 6;
+        tagged(&mut img[lvd..lvd + 16], tag::LOGICAL_VOLUME);
+        tagged(&mut img[sector(34)..sector(34) + 16], tag::TERMINATING);
+
+        let block = |lbn: usize| sector(PARTITION as usize + lbn);
+        let fsd = block(0);
+        img[fsd + 404..fsd + 408].copy_from_slice(&1u32.to_le_bytes());
+        tagged(&mut img[fsd..fsd + 16], tag::FILE_SET);
+
+        for (i, node) in nodes.iter().enumerate() {
+            let (fe_lbn, data_lbn) = (1 + 2 * i, 2 + 2 * i);
+            let data: Vec<u8> = match node {
+                Node::File(bytes) => bytes.clone(),
+                Node::Dir(children) => {
+                    let mut d = Vec::new();
+                    for (name, child) in children {
+                        let mut fid = vec![0u8; (38 + 1 + name.len()).div_ceil(4) * 4];
+                        fid[18] = if matches!(nodes[*child], Node::Dir(_)) {
+                            2
+                        } else {
+                            0
+                        };
+                        fid[19] = 1 + name.len() as u8;
+                        fid[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+                        fid[24..28].copy_from_slice(&(1 + 2 * *child as u32).to_le_bytes());
+                        fid[38] = 8;
+                        fid[39..39 + name.len()].copy_from_slice(name.as_bytes());
+                        tagged(&mut fid, tag::FILE_ID);
+                        d.extend(fid);
+                    }
+                    d
+                }
+            };
+            assert!(data.len() <= SECTOR as usize, "one block per node");
+            img[block(data_lbn)..block(data_lbn) + data.len()].copy_from_slice(&data);
+            let fe = block(fe_lbn);
+            img[fe + 16 + 11] = if matches!(node, Node::Dir(_)) { 4 } else { 5 };
+            img[fe + 56..fe + 64].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            img[fe + 172..fe + 176].copy_from_slice(&8u32.to_le_bytes()); // one short_ad
+            img[fe + 176..fe + 180].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+            img[fe + 180..fe + 184].copy_from_slice(&(data_lbn as u32).to_le_bytes());
+            tagged(&mut img[fe..fe + 16], tag::FILE_ENTRY);
+        }
+        img
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample() -> Vec<build::Node> {
+        use build::Node::*;
+        vec![
+            Dir(vec![("EFI", 1), ("setup.exe", 3)]),
+            Dir(vec![("BOOT", 2)]),
+            Dir(vec![]),
+            File(b"MZ".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn walks_a_built_image() {
+        let mut udf = Udf::open(std::io::Cursor::new(build::udf(&sample(), 6))).unwrap();
+        assert_eq!(udf.volume_id, "TEST");
+        let paths: Vec<String> = udf.walk().unwrap().into_iter().map(|e| e.path).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(paths.contains(&"EFI/BOOT".to_string()));
+        assert!(paths.contains(&"setup.exe".to_string()));
+    }
+
+    #[test]
+    fn refuses_a_partition_map_too_short_to_read() {
+        for map_len in 1..=5 {
+            let r = Udf::open(std::io::Cursor::new(build::udf(&sample(), map_len)));
+            assert!(r.is_err(), "map length {map_len}");
+        }
+    }
+
+    /// Many directories naming one subdirectory: each would be read again
+    /// per parent. Refused at the second visit.
+    #[test]
+    fn refuses_a_directory_reached_twice() {
+        use build::Node::*;
+        let parents: Vec<(&'static str, usize)> =
+            ["a", "b", "c", "d"].iter().map(|n| (*n, 1)).collect();
+        let nodes = vec![Dir(parents), Dir(vec![("x", 2)]), File(vec![1])];
+        let mut udf = Udf::open(std::io::Cursor::new(build::udf(&nodes, 6))).unwrap();
+        let e = udf.walk().unwrap_err();
+        assert!(e.to_string().contains("reached twice"), "{e}");
+    }
 
     #[test]
     fn decodes_osta_names() {

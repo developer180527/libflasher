@@ -80,6 +80,49 @@ pub fn pagefile_letter(entry: &str) -> Option<char> {
     (chars.next() == Some(':')).then(|| letter.to_ascii_uppercase())
 }
 
+/// How long to keep trying to lock a volume, and how often. Explorer,
+/// antivirus scanners and the indexer open a drive's volumes for a moment
+/// after it is plugged in; a lock refused then is worth asking again.
+pub const LOCK_TRIES: u32 = 20;
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Call `op` until it succeeds or `tries` calls have failed, waiting `wait`
+/// between them; the last error if none succeeded.
+pub fn retry<T, E>(
+    tries: u32,
+    wait: std::time::Duration,
+    mut op: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut left = tries.max(1);
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if left <= 1 => return Err(e),
+            Err(_) => {
+                left -= 1;
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
+/// What to tell someone whose drive could not be locked: which drive, by
+/// letter where it has any, and what to do.
+pub fn busy_message(letters: &[char]) -> String {
+    let which = if letters.is_empty() {
+        "the drive".to_string()
+    } else {
+        letters
+            .iter()
+            .map(|l| format!("{l}:"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "another program is using {which}; close any windows or programs using it and try again"
+    )
+}
+
 pub fn disk_path(number: u32) -> String {
     format!(r"\\.\PhysicalDrive{number}")
 }
@@ -218,6 +261,38 @@ mod tests {
         assert_eq!(pagefile_letter(r"d:\pagefile.sys"), Some('D'));
         assert_eq!(pagefile_letter(r"\??\Volume{x}\pagefile.sys"), None);
         assert_eq!(pagefile_letter(""), None);
+    }
+
+    #[test]
+    fn retries_until_it_works_or_gives_up() {
+        let zero = std::time::Duration::ZERO;
+        let mut calls = 0;
+        let r: Result<u32, &str> = retry(5, zero, || {
+            calls += 1;
+            if calls < 3 {
+                Err("busy")
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(r, Ok(3));
+        let mut calls = 0;
+        let r: Result<(), &str> = retry(4, zero, || {
+            calls += 1;
+            Err("busy")
+        });
+        assert_eq!((r, calls), (Err("busy"), 4));
+        assert_eq!(
+            LOCK_TRIES as u128 * LOCK_WAIT.as_millis(),
+            5000,
+            "about 5 s"
+        );
+    }
+
+    #[test]
+    fn busy_messages_name_the_drive() {
+        assert!(busy_message(&['E', 'F']).contains("E:, F:"));
+        assert!(busy_message(&[]).contains("the drive"));
     }
 
     #[test]

@@ -58,15 +58,20 @@ pub(crate) struct Layout {
 }
 
 /// The partition a disk of `size` bytes with `sector`-byte sectors gets.
+///
+/// At most what FAT32 can address: its sector count is 32 bits, so 2 TiB
+/// with 512-byte sectors (16 TiB with 4096). On a larger disk the rest is
+/// left unpartitioned rather than formatted into a volume nothing can mount.
 pub(crate) fn layout(size: u64, sector: u64) -> Option<Layout> {
     let sectors = size / sector;
     let table = ENTRIES * ENTRY_SIZE / sector;
     let last_usable = sectors.checked_sub(2 + table)?; // backup entries + header
     let start = ALIGN;
     let end = ((last_usable + 1) * sector) / ALIGN * ALIGN; // exclusive, aligned down
+    let fat32_max = u32::MAX as u64 * sector / ALIGN * ALIGN;
     (end > start).then(|| Layout {
         start,
-        len: end - start,
+        len: (end - start).min(fat32_max),
     })
 }
 
@@ -178,6 +183,22 @@ mod tests {
             );
         }
         assert_eq!(layout(1 << 20, 512), None, "too small");
+    }
+
+    #[test]
+    fn a_partition_never_outgrows_fat32() {
+        for (size, sector, cap) in [
+            (3u64 << 40, 512u64, (2u64 << 40) - ALIGN),
+            (20 << 40, 4096, (16 << 40) - ALIGN),
+        ] {
+            let l = layout(size, sector).unwrap();
+            assert_eq!(l.len, cap, "{size} {sector}");
+            assert!(l.len / sector <= u32::MAX as u64);
+            assert_eq!(l.len % ALIGN, 0);
+        }
+        // Below the limit, nothing changes.
+        let l = layout(1 << 40, 512).unwrap();
+        assert_eq!(l.len, (1 << 40) - (2 << 20));
     }
 
     #[test]

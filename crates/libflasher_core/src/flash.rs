@@ -396,6 +396,28 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// A zipped image: its exact size is known before writing, and it is
+    /// written and verified like any other.
+    #[test]
+    #[cfg(feature = "zip")]
+    fn writes_zip() {
+        use crate::zip::build::{zip, Options};
+        let data = pattern();
+        let o = Options {
+            deflate: true,
+            zip64: true,
+            descriptor: false,
+        };
+        let path = temp("img.zip", &zip(&[("README", b"x"), ("pi.img", &data)], &o));
+        let info = image::inspect(&path).unwrap();
+        assert_eq!(info.disk_size, Some(data.len() as u64));
+        assert_eq!(info.archive_entry.as_deref(), Some("pi.img"));
+        let (r, dev) = run(&path, CHUNK * 3);
+        assert_eq!(r.unwrap(), data.len() as u64);
+        assert_eq!(&dev[..data.len()], &data[..]);
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn refuses_image_larger_than_device() {
         let path = temp("big.img", &pattern());

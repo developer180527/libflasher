@@ -23,6 +23,9 @@ const HDR_SPANNED: u32 = 0x0000_0008;
 const RES_METADATA: u8 = 0x02;
 const RES_COMPRESSED: u8 = 0x04;
 const RES_SOLID: u8 = 0x10;
+/// Largest lookup table read: over a million resources, far past any real
+/// WIM. The header's claim is not trusted with an allocation.
+const MAX_LOOKUP: u64 = 64 << 20;
 
 /// Offsets of the header's resource headers.
 mod at {
@@ -156,7 +159,10 @@ pub(crate) fn split(
     let lookup = ResHdr::read(&header[at::LOOKUP..]);
     let xml = ResHdr::read(&header[at::XML..]);
     let boot = ResHdr::read(&header[at::BOOT..]);
-    if lookup.flags & RES_COMPRESSED != 0 || !lookup.size.is_multiple_of(ENTRY as u64) {
+    if lookup.flags & RES_COMPRESSED != 0
+        || !lookup.size.is_multiple_of(ENTRY as u64)
+        || lookup.size > MAX_LOOKUP
+    {
         return Err("install.wim has a lookup table this cannot read".into());
     }
     for r in [lookup, xml] {
@@ -506,6 +512,18 @@ pub(crate) mod tests {
     /// Split the WIM in `FLASHER_TEST_WIM` into `FLASHER_TEST_SWM_DIR` with
     /// parts of `FLASHER_TEST_SWM_PART` bytes. CI then has wimlib, an
     /// independent implementation, verify and apply the split set.
+    /// A header claiming a huge lookup table is refused before anything
+    /// that size is allocated.
+    #[test]
+    fn refuses_an_oversized_lookup_table() {
+        let mut w = wim(1, &[1000]);
+        let size = (MAX_LOOKUP / ENTRY as u64 + 1) * ENTRY as u64;
+        w[at::LOOKUP..at::LOOKUP + 7].copy_from_slice(&size.to_le_bytes()[..7]);
+        w[at::LOOKUP + 8..at::LOOKUP + 16].copy_from_slice(&(HEADER as u64).to_le_bytes());
+        let e = split(&mut &w[..], 4 << 30, 1 << 20, "install").unwrap_err();
+        assert!(e.contains("lookup table"), "{e}");
+    }
+
     #[test]
     #[ignore = "needs FLASHER_TEST_WIM, FLASHER_TEST_SWM_DIR, FLASHER_TEST_SWM_PART"]
     fn split_wim_to_dir() {

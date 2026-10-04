@@ -490,6 +490,14 @@ fn verify(
         if let Some(offset) = mismatch {
             return Err(Error::VerifyFailed { offset });
         }
+        // Every byte meant to be there is; nothing else may be. A damaged
+        // directory entry can claim more.
+        let len = f
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|err| device_err(err, verified))?;
+        if len != item.size() {
+            return Err(Error::VerifyFailed { offset: verified });
+        }
     }
     Ok(())
 }
@@ -573,6 +581,47 @@ mod tests {
                 .unwrap();
             assert_eq!(got, f.data, "{}", f.path);
         }
+        std::fs::remove_file(disk).ok();
+    }
+
+    /// A file on the drive longer than the one in the ISO fails
+    /// verification, though every byte the ISO has matches.
+    #[test]
+    fn verify_notices_a_file_of_the_wrong_length() {
+        let img = temp("len.iso", &iso("LEN", &files(), true));
+        let info = crate::image::inspect(&img).unwrap();
+        let disk = temp("len.disk", &vec![0u8; 96 << 20]);
+        let mut dev = FileDevice::open(&disk).unwrap();
+        let no = AtomicBool::new(false);
+        extract(&info, &mut dev, &FlashOptions::default(), &no, &mut |_| {}).unwrap();
+
+        let layout = gpt::layout(dev.size(), 512).unwrap();
+        let stall = std::time::Duration::from_secs(20);
+        fn open(
+            dev: &mut FileDevice,
+            layout: gpt::Layout,
+            stall: std::time::Duration,
+        ) -> BlockIo<'_> {
+            BlockIo::new(dev, layout.start, layout.len, stall, 32 << 20)
+        }
+        {
+            let mut io = open(&mut dev, layout, stall);
+            let fs = fatfs::FileSystem::new(&mut io, fatfs::FsOptions::new()).unwrap();
+            let mut f = fs.root_dir().open_file("README.diskdefines").unwrap();
+            f.seek(std::io::SeekFrom::End(0)).unwrap();
+            f.write_all(b"extra").unwrap();
+            drop(f);
+            fs.unmount().unwrap();
+            io.sync().unwrap();
+        }
+        let mut src = Source::open(&info).unwrap();
+        let items = items(&mut src, LIMITS).unwrap();
+        let mut io = open(&mut dev, layout, stall);
+        let r = verify(&mut io, &mut src, &items, 0, &no, &mut |_| {}, &|e, at| {
+            Error::Io(e).at_device(at)
+        });
+        assert!(matches!(r, Err(Error::VerifyFailed { .. })), "{r:?}");
+        std::fs::remove_file(img).ok();
         std::fs::remove_file(disk).ok();
     }
 
@@ -697,6 +746,33 @@ mod tests {
         }
         std::fs::remove_file(img).ok();
         std::fs::remove_file(disk).ok();
+    }
+
+    /// A 3 TiB disk: the partition stops at FAT32's 2 TiB and extraction
+    /// succeeds (without the cap: "Volume has too many sectors"). The disk is
+    /// a sparse file, which macOS and Linux make instantly; on Windows it
+    /// would really take 3 TiB.
+    #[test]
+    #[cfg(unix)]
+    fn extracts_onto_a_disk_larger_than_fat32_can_address() {
+        let img = temp("big.iso", &iso("BIG", &files(), true));
+        let info = crate::image::inspect(&img).unwrap();
+        let disk = std::env::temp_dir().join(format!("libflasher_3t_{}", std::process::id()));
+        std::fs::File::create(&disk)
+            .unwrap()
+            .set_len(3 << 40)
+            .unwrap();
+        let mut dev = FileDevice::open(&disk).unwrap();
+        let r = extract(
+            &info,
+            &mut dev,
+            &FlashOptions::default(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        std::fs::remove_file(img).ok();
+        std::fs::remove_file(disk).ok();
+        r.unwrap();
     }
 
     /// Extract the ISO in `FLASHER_TEST_ISO` into the file `FLASHER_TEST_OUT`

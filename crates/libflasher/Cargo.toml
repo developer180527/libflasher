@@ -11,11 +11,12 @@ keywords = ["usb", "flash", "disk-image", "iso", "raspberry-pi"]
 categories = ["filesystem", "command-line-utilities"]
 
 [features]
-default = ["gzip", "xz", "zstd", "bzip2"]
+default = ["gzip", "xz", "zstd", "bzip2", "zip"]
 gzip = ["libflasher_core/gzip"]
 xz = ["libflasher_core/xz"]
 zstd = ["libflasher_core/zstd"]
 bzip2 = ["libflasher_core/bzip2"]
+zip = ["libflasher_core/zip"]
 
 [dependencies]
 libflasher_core.workspace = true

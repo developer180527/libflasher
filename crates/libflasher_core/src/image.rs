@@ -1,7 +1,7 @@
 //! What is in an image file, and a reader that yields its raw disk bytes.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,6 +22,8 @@ pub enum Compression {
     Zstd,
     /// `.bz2`
     Bzip2,
+    /// `.zip` holding one image (stored or deflated).
+    Zip,
 }
 
 impl Compression {
@@ -33,6 +35,7 @@ impl Compression {
             Self::Xz => "xz",
             Self::Zstd => "zstd",
             Self::Bzip2 => "bzip2",
+            Self::Zip => "zip",
         }
     }
 
@@ -42,6 +45,7 @@ impl Compression {
             [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => Self::Xz,
             [0x28, 0xb5, 0x2f, 0xfd, ..] => Self::Zstd,
             [b'B', b'Z', b'h', ..] => Self::Bzip2,
+            [b'P', b'K', 3, 4, ..] => Self::Zip,
             _ => Self::None,
         }
     }
@@ -118,8 +122,10 @@ pub struct ImageInfo {
     /// Size of the file on disk.
     pub file_size: u64,
     /// Size once decompressed, when it is known exactly without decompressing
-    /// (uncompressed and `.xz` images). `None` means unknown, not zero.
+    /// (uncompressed, `.xz` and `.zip` images). `None` means unknown, not zero.
     pub disk_size: Option<u64>,
+    /// For an archive, the name of the image inside it.
+    pub archive_entry: Option<String>,
     /// When the file was last modified, as [`inspect`] saw it (`None` where
     /// the OS does not say). With `file_size`, how [`ImageInfo::open_file`]
     /// tells that the file changed since.
@@ -149,13 +155,19 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ImageInfo> {
     let n = read_full(&mut reader, &mut head)?;
     head.truncate(n);
 
-    let disk_size = match compression {
-        Compression::None => Some(file_size),
+    let (disk_size, archive_entry) = match compression {
+        Compression::None => (Some(file_size), None),
         // Exact, from the index at the end of the file; no decompression.
-        Compression::Xz => crate::xz_size::uncompressed_size(&path),
+        Compression::Xz => (crate::xz_size::uncompressed_size(&path), None),
+        // Exact, from the central directory.
+        #[cfg(feature = "zip")]
+        Compression::Zip => {
+            let entry = crate::zip::find(&mut File::open(&path)?).map_err(zip_error)?;
+            (Some(entry.size), Some(entry.name))
+        }
         // gzip records the size modulo 4 GiB, which is a guess for disk
         // images; zstd only sometimes records it; bzip2 never. Unknown is honest.
-        _ => None,
+        _ => (None, None),
     };
     Ok(ImageInfo {
         path,
@@ -163,8 +175,18 @@ pub fn inspect(path: impl AsRef<Path>) -> Result<ImageInfo> {
         kind: ImageKind::classify(&head),
         file_size,
         disk_size,
+        archive_entry,
         modified,
     })
+}
+
+/// A zip problem as this crate's error: what cannot be read is `Unsupported`.
+#[cfg(feature = "zip")]
+fn zip_error(e: io::Error) -> crate::Error {
+    match e.kind() {
+        io::ErrorKind::Unsupported => crate::Error::Unsupported(e.to_string()),
+        _ => crate::Error::Io(e),
+    }
 }
 
 /// An image opened for reading its decompressed bytes.
@@ -207,7 +229,13 @@ impl ImageInfo {
     }
 }
 
-fn decoder<R: Read + Send + 'static>(c: Compression, r: R) -> Result<Box<dyn Read + Send>> {
+fn decoder<R: Read + Seek + Send + 'static>(c: Compression, r: R) -> Result<Box<dyn Read + Send>> {
+    #[cfg(feature = "zip")]
+    if c == Compression::Zip {
+        let mut r = r;
+        let entry = crate::zip::find(&mut r).map_err(zip_error)?;
+        return crate::zip::reader(r, &entry).map_err(zip_error);
+    }
     let r = BufReader::with_capacity(1 << 20, r);
     Ok(match c {
         Compression::None => Box::new(r),
@@ -238,6 +266,13 @@ impl<R: Read> Read for Counting<R> {
         let n = self.inner.read(buf)?;
         self.count.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
+    }
+}
+
+/// Seeking (a zip's central directory) is not consuming: only reads count.
+impl<R: Seek> Seek for Counting<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(to)
     }
 }
 
@@ -340,6 +375,7 @@ mod tests {
             Compression::Zstd
         );
         assert_eq!(Compression::sniff(b"BZh9"), Compression::Bzip2);
+        assert_eq!(Compression::sniff(b"PK\x03\x04"), Compression::Zip);
         assert_eq!(Compression::sniff(b"\x00\x00"), Compression::None);
     }
 }

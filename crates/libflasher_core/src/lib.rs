@@ -15,6 +15,8 @@ mod error;
 pub mod extract;
 mod flash;
 mod gpt;
+#[cfg(test)]
+mod hostile;
 pub mod image;
 pub mod iso9660;
 pub mod mock;
@@ -23,6 +25,8 @@ pub mod rate;
 pub mod udf;
 mod wim;
 mod xz_size;
+#[cfg(feature = "zip")]
+mod zip;
 
 pub use error::{Error, Result};
 pub use flash::{flash, verify_device, write_image, FlashOptions, Progress};

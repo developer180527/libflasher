@@ -8,6 +8,13 @@
 //! writes back over the image). Every such mount goes through
 //! DiskArbitration, which asks each session's approval callback first.
 //!
+//! The refusal is not enough on its own either: macOS 26 asks for approval,
+//! receives the refusal and mounts the volume anyway (seen on CI; macOS 27
+//! honours it). So the hold also watches for any volume of the disk being
+//! mounted, force-unmounts it at once, and remembers that it happened:
+//! [`Claim::remounted`]. A write that was under way may have been disturbed,
+//! so the open disk fails from then on rather than carry on.
+//!
 //! Not `DADiskClaim`: on macOS 27 its completion callback never runs, even
 //! from a minimal C program, so a claim cannot be confirmed. Refusing mounts
 //! is what matters, and it needs no privilege.
@@ -35,6 +42,9 @@ type DAReturn = i32;
 
 type ApprovalCallback = extern "C" fn(disk: DADiskRef, context: *mut c_void) -> DADissenterRef;
 type DiskCallback = extern "C" fn(disk: DADiskRef, context: *mut c_void);
+type ChangedCallback = extern "C" fn(disk: DADiskRef, keys: CFTypeRef, context: *mut c_void);
+/// `kDADiskUnmountOptionForce`.
+const UNMOUNT_FORCE: u32 = 0x0008_0000;
 
 /// `kDAReturnExclusiveAccess`: "the disk is in exclusive use".
 const EXCLUSIVE_ACCESS: DAReturn = 0xF8DA_0004_u32 as i32;
@@ -57,6 +67,16 @@ extern "C" {
         callback: DiskCallback,
         context: *mut c_void,
     );
+    fn DARegisterDiskDescriptionChangedCallback(
+        session: DASessionRef,
+        matching: CFTypeRef,
+        watch: CFTypeRef,
+        callback: ChangedCallback,
+        context: *mut c_void,
+    );
+    fn DADiskCopyDescription(disk: DADiskRef) -> CFTypeRef;
+    fn DADiskUnmount(disk: DADiskRef, options: u32, callback: CFTypeRef, context: *mut c_void);
+    static kDADiskDescriptionVolumePathKey: CFTypeRef;
     fn DAUnregisterCallback(session: DASessionRef, callback: *mut c_void, context: *mut c_void);
     fn DAUnregisterApprovalCallback(
         session: DASessionRef,
@@ -81,6 +101,7 @@ extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopRunInMode(mode: CFTypeRef, seconds: f64, return_after_source_handled: u8) -> i32;
     fn CFRelease(cf: CFTypeRef);
+    fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
     static kCFRunLoopDefaultMode: CFTypeRef;
 }
 
@@ -102,6 +123,11 @@ struct Shared {
     whole: CString,
     seen: AtomicBool,
     refused: AtomicUsize,
+    /// A volume of the disk was mounted while held (and unmounted again).
+    remounted: AtomicBool,
+    /// Whether to refuse mounts; off only in tests, to stand in for a macOS
+    /// that ignores the refusal.
+    refuse: bool,
 }
 
 impl Shared {
@@ -125,8 +151,34 @@ extern "C" fn refuse_mount(disk: DADiskRef, context: *mut c_void) -> DADissenter
         return std::ptr::null_mut();
     }
     shared.refused.fetch_add(1, Ordering::Relaxed);
+    if !shared.refuse {
+        return std::ptr::null_mut();
+    }
     // DiskArbitration releases the dissenter it is given.
     unsafe { DADissenterCreate(std::ptr::null(), EXCLUSIVE_ACCESS, std::ptr::null()) }
+}
+
+/// A disk's description changed: if one of our volumes now has a mount
+/// point, macOS mounted it despite the refusal. Unmount it at once.
+extern "C" fn changed(disk: DADiskRef, _keys: CFTypeRef, context: *mut c_void) {
+    // SAFETY: as in `refuse_mount`; the description is ours to release.
+    let shared = unsafe { &*(context as *const Shared) };
+    if !shared.ours(disk) {
+        return;
+    }
+    let mounted = unsafe {
+        let d = DADiskCopyDescription(disk);
+        if d.is_null() {
+            return;
+        }
+        let path = CFDictionaryGetValue(d, kDADiskDescriptionVolumePathKey);
+        CFRelease(d);
+        !path.is_null()
+    };
+    if mounted {
+        shared.remounted.store(true, Ordering::Relaxed);
+        unsafe { DADiskUnmount(disk, UNMOUNT_FORCE, std::ptr::null(), std::ptr::null_mut()) };
+    }
 }
 
 extern "C" fn appeared(disk: DADiskRef, context: *mut c_void) {
@@ -140,8 +192,6 @@ extern "C" fn appeared(disk: DADiskRef, context: *mut c_void) {
 /// The disk is held until this is dropped.
 pub struct Claim {
     stop: Arc<AtomicBool>,
-    /// For tests, which ask how many mounts were refused.
-    #[cfg(test)]
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
@@ -151,10 +201,16 @@ impl Claim {
     /// partitions until dropped. Returns once the refusal is in place; `Err`
     /// if DiskArbitration is unavailable or never reports the disk.
     pub fn take(bsd_name: &str) -> Result<Self, String> {
+        Self::with(bsd_name, true)
+    }
+
+    fn with(bsd_name: &str, refuse: bool) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             whole: CString::new(bsd_name).map_err(|e| e.to_string())?,
             seen: AtomicBool::new(false),
             refused: AtomicUsize::new(0),
+            remounted: AtomicBool::new(false),
+            refuse,
         });
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
@@ -180,6 +236,13 @@ impl Claim {
                         context,
                     );
                     DARegisterDiskAppearedCallback(session, std::ptr::null(), appeared, context);
+                    DARegisterDiskDescriptionChangedCallback(
+                        session,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        changed,
+                        context,
+                    );
                     let run_loop = CFRunLoopGetCurrent();
                     DASessionScheduleWithRunLoop(session, run_loop, kCFRunLoopDefaultMode);
                     let end = std::time::Instant::now() + READY_TIMEOUT;
@@ -196,6 +259,7 @@ impl Claim {
                         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, 0);
                     }
                     DAUnregisterCallback(session, appeared as *mut c_void, context);
+                    DAUnregisterCallback(session, changed as *mut c_void, context);
                     DAUnregisterApprovalCallback(session, refuse_mount as *mut c_void, context);
                     DASessionUnscheduleFromRunLoop(session, run_loop, kCFRunLoopDefaultMode);
                     CFRelease(session as CFTypeRef);
@@ -205,7 +269,6 @@ impl Claim {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 stop,
-                #[cfg(test)]
                 shared,
                 thread: Some(thread),
             }),
@@ -218,6 +281,12 @@ impl Claim {
                 Err("the claim thread stopped".into())
             }
         }
+    }
+
+    /// Whether macOS mounted a volume of the disk while it was held. It was
+    /// unmounted again, but anything written meanwhile may be damaged.
+    pub fn remounted(&self) -> bool {
+        self.shared.remounted.load(Ordering::Relaxed)
     }
 
     /// How many mounts of the disk have been refused so far.
@@ -249,6 +318,13 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Whether any volume of `/dev/diskN` is mounted.
+    fn mounted_at(whole: &str) -> bool {
+        command_text("mount", &[])
+            .lines()
+            .any(|l| l.starts_with(&format!("{whole}s")) || l.starts_with(&format!("{whole} ")))
+    }
+
     #[test]
     fn names_on_a_disk() {
         assert!(is_on("disk4", "disk4"));
@@ -260,12 +336,25 @@ mod tests {
         assert!(!is_on("disk4s1x", "disk4"));
     }
 
-    /// A disk image with a FAT volume, attached unmounted: while held,
-    /// `diskutil mountDisk` is refused; once the hold is dropped, it works.
+    /// A disk image with a FAT volume, attached unmounted: while held, a
+    /// `diskutil mountDisk` is refused, or undone within moments and
+    /// recorded; once the hold is dropped, mounting works.
     /// Needs no root.
     #[test]
-    fn a_claimed_disk_cannot_be_mounted() {
-        let dir = std::env::temp_dir().join(format!("libflasher_claim_{}", std::process::id()));
+    fn nothing_stays_mounted_while_held() {
+        held_disk_test(true);
+    }
+
+    /// As macOS 26 behaves: the refusal is ignored and the mount goes
+    /// through. It must be undone and recorded, on any macOS.
+    #[test]
+    fn a_mount_that_gets_through_is_undone() {
+        held_disk_test(false);
+    }
+
+    fn held_disk_test(refuse: bool) {
+        let dir =
+            std::env::temp_dir().join(format!("libflasher_claim_{}_{refuse}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("c.dmg");
@@ -310,16 +399,40 @@ mod tests {
                 .success()
         };
         let result = std::panic::catch_unwind(|| {
-            let claim = Claim::take(&bsd).expect("claim");
-            let mounted = mount();
+            let claim = Claim::with(&bsd, refuse).expect("claim");
+            let refused_outright = !mount();
+            if !refuse {
+                assert!(
+                    !refused_outright,
+                    "mounted with no refusal in place: setup broken"
+                );
+            }
+            assert!(claim.refused() > 0, "the refusal was never asked");
+            // Refused (macOS 27), or mounted and taken down again (macOS 26):
+            // either way nothing stays mounted, and a mount is remembered.
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while mounted_at(&whole) && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             assert!(
-                !mounted,
-                "mounted while held (macOS {}, {} session); the refusal was asked {} times",
-                command_text("sw_vers", &["-productVersion"]),
-                command_text("launchctl", &["managername"]),
-                claim.refused()
+                !mounted_at(&whole),
+                "still mounted 5 s after a mount while held (macOS {})",
+                command_text("sw_vers", &["-productVersion"])
             );
-            assert!(claim.refused() > 0, "refused without being asked");
+            assert_eq!(
+                claim.remounted(),
+                !refused_outright,
+                "a mount while held went unrecorded, or one was recorded that did not happen"
+            );
+            eprintln!(
+                "macOS {}: mount {}",
+                command_text("sw_vers", &["-productVersion"]),
+                if refused_outright {
+                    "refused"
+                } else {
+                    "allowed, then undone"
+                }
+            );
             drop(claim);
             assert!(mount(), "not mountable once released");
         });

@@ -270,13 +270,28 @@ struct Disk {
     _claim: claim::Claim,
 }
 
+impl Disk {
+    /// Fail once macOS has mounted the disk under us (see `claim`).
+    fn undisturbed(&self) -> io::Result<()> {
+        if self._claim.remounted() {
+            return Err(io::Error::other(
+                "macOS mounted the drive while it was being written, which may have \
+                 changed it; flash it again",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Read for Disk {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.undisturbed()?;
         self.file.read(buf)
     }
 }
 impl Write for Disk {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.undisturbed()?;
         self.file.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {

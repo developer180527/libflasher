@@ -239,16 +239,27 @@ fn recv_fd(sock: &UnixStream) -> io::Result<Option<OwnedFd>> {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Every descriptor that arrived is ours to close: keep the first.
+        let mut fds: Vec<OwnedFd> = Vec::new();
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let fd: i32 = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
-                return Ok(Some(OwnedFd::from_raw_fd(fd)));
+                let bytes = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
+                for i in 0..bytes / std::mem::size_of::<libc::c_int>() {
+                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::other("descriptor message truncated"));
+        }
+        let Some(fd) = fds.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(fd))
     }
-    Ok(None)
 }
 
 #[cfg(test)]

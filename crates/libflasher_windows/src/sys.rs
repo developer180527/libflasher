@@ -137,15 +137,18 @@ impl Platform for Windows {
     /// `diskpart` is in every Windows and is what Disk Management uses.
     fn restore(&self, device: &DeviceInfo, label: &str) -> Result<()> {
         let (n, _) = checked(device)?;
-        let script =
-            std::env::temp_dir().join(format!("libflasher-restore-{}.txt", std::process::id()));
-        std::fs::write(&script, policy::restore_script(n, label))?;
+        // diskpart stops at the first error, and says so in its exit status,
+        // only when it runs a script file (`/s`); fed on stdin it carries on.
+        // This process is elevated and diskpart runs what the file says, so
+        // the file must be out of reach of the user's unelevated programs:
+        // see `ScriptFile`.
+        let script = ScriptFile::create(&policy::restore_script(n, label))?;
         let out = Command::new("diskpart")
             .arg("/s")
-            .arg(&script)
+            .arg(&script.path)
             .stdin(Stdio::null())
             .output();
-        let _ = std::fs::remove_file(&script);
+        drop(script);
         let out = out.map_err(|e| tool("diskpart", e))?;
         if !out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -343,10 +346,75 @@ fn system_disks() -> Result<Vec<u32>> {
 
 /// The drive letter of the Windows directory.
 fn windows_letter() -> Option<char> {
+    windows_dir()?
+        .to_str()?
+        .chars()
+        .next()
+        .filter(char::is_ascii_alphabetic)
+}
+
+/// `C:\Windows`.
+fn windows_dir() -> Option<std::path::PathBuf> {
     let mut buf = [0u16; 260];
     let len = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    let dir = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
-    dir.chars().next().filter(char::is_ascii_alphabetic)
+    (len > 0 && len < buf.len()).then(|| String::from_utf16_lossy(&buf[..len]).into())
+}
+
+/// A diskpart script on disk, that nothing but diskpart can read and nothing
+/// can change while it exists.
+///
+/// The user's `%TEMP%` would not do: their unelevated programs can write
+/// there, and could swap the script between our writing it and diskpart
+/// reading it — running their commands as administrator. So: the system's
+/// `Windows\Temp`; a name created fresh (never an existing file someone
+/// planted); and held open, denying others write and delete access, until
+/// diskpart has finished with it.
+struct ScriptFile {
+    path: std::path::PathBuf,
+    held: Option<File>,
+}
+
+impl ScriptFile {
+    fn create(text: &str) -> Result<Self> {
+        let dir = windows_dir()
+            .map(|d| d.join("Temp"))
+            .ok_or_else(|| tool("diskpart", "could not find the Windows directory"))?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..16u32 {
+            let path = dir.join(format!(
+                "libflasher-restore-{}-{nanos}-{attempt}.txt",
+                std::process::id()
+            ));
+            let file = File::options()
+                .write(true)
+                .create_new(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&path);
+            match file {
+                Ok(mut f) => {
+                    f.write_all(text.as_bytes())?;
+                    f.sync_all()?;
+                    return Ok(Self {
+                        path,
+                        held: Some(f),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(tool("diskpart", "could not create its script file"))
+    }
+}
+
+impl Drop for ScriptFile {
+    fn drop(&mut self) {
+        drop(self.held.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Every disk a volume lies on.

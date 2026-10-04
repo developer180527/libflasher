@@ -107,23 +107,48 @@ impl Platform for Linux {
         watch::Watcher::start(on_change).map(|w| Box::new(w) as Box<dyn std::any::Any + Send>)
     }
 
-    /// systemd's sleep inhibitor, held by a child that sleeps until killed.
-    /// `systemd-inhibit --list` shows it under the running program's name.
+    /// systemd's sleep inhibitor, held by a child that lives exactly as
+    /// long as this process: `tail --pid=<us>` exits when we do, even if we
+    /// are killed, and `systemd-inhibit` releases the lock as it ends — what
+    /// `caffeinate -w` does on macOS. `systemd-inhibit --list` shows it
+    /// under the running program's name.
     fn keep_awake(&self, reason: &str) -> Option<Box<dyn std::any::Any + Send>> {
-        let child = Command::new("systemd-inhibit")
-            .args([
-                "--what=sleep:idle",
-                &format!("--who={}", program_name()),
-                &format!("--why={reason}"),
-                "--mode=block",
-                "sleep",
-                "infinity",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+        let pid = std::process::id();
+        let held: Vec<String> = if tail_follows_pids() {
+            vec![
+                "tail".into(),
+                format!("--pid={pid}"),
+                "-f".into(),
+                "/dev/null".into(),
+            ]
+        } else {
+            // busybox's tail has no --pid: the death signal below is then
+            // the only tie to this process.
+            vec!["sleep".into(), "infinity".into()]
+        };
+        let mut cmd = Command::new("systemd-inhibit");
+        cmd.args([
+            "--what=sleep:idle".to_string(),
+            format!("--who={}", program_name()),
+            format!("--why={reason}"),
+            "--mode=block".into(),
+        ])
+        .args(&held)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        // SAFETY: prctl is async-signal-safe, as pre_exec requires. The
+        // signal comes when the *thread* that spawned the child ends, not
+        // the process; harmless here, as the guard never outlives the
+        // thread that took it, and its drop kills the child anyway.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().ok()?;
         Some(Box::new(KillOnDrop(child)))
     }
 
@@ -199,7 +224,7 @@ pub(crate) fn restore_as_root(device: &DeviceInfo, label: &str) -> Result<()> {
         ""
     };
     let part = format!("/dev/{name}{sep}1");
-    run("mkfs.exfat", &["-n", label, &part], None)?;
+    run("mkfs.exfat", &["-n", label, "--", &part], None)?;
     Ok(())
 }
 
@@ -392,6 +417,18 @@ fn drop_cache(file: &File) -> Result<()> {
     }
 }
 
+/// Whether this system's `tail` can follow a process (GNU coreutils can;
+/// busybox cannot).
+fn tail_follows_pids() -> bool {
+    Command::new("tail")
+        .args(["--pid=1", "--version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// The running program's file name, for naming it to the OS.
 fn program_name() -> String {
     std::env::current_exe()
@@ -402,6 +439,35 @@ fn program_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// What `keep_awake` relies on: `tail --pid` ends when the process it
+    /// follows does, however that process ends (here, SIGKILL).
+    #[test]
+    fn tail_ends_with_the_process_it_follows() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        if !super::tail_follows_pids() {
+            return; // busybox: keep_awake falls back to the death signal
+        }
+        let mut target = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut tail = Command::new("tail")
+            .arg(format!("--pid={}", target.id()))
+            .args(["-f", "/dev/null"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(tail.try_wait().unwrap().is_none(), "tail ended early");
+        target.kill().unwrap();
+        target.wait().unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while tail.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < end,
+                "tail outlived the process it followed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// See `libflasher_core::conformance`: runs in CI as root, against a
     /// loop device named in `FLASHER_TEST_DISK`.
     /// Attaching a loop device is a block "add" uevent. Needs root for

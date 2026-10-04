@@ -12,7 +12,6 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
-use std::ptr;
 
 use libflasher_core::{Error, Result};
 
@@ -73,16 +72,33 @@ fn recv_fd(sock: &UnixStream) -> io::Result<Option<OwnedFd>> {
             return Err(io::Error::last_os_error());
         }
 
+        // Every descriptor that arrived is ours to close: keep the first.
+        let mut fds: Vec<OwnedFd> = Vec::new();
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let fd: libc::c_int = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
-                return Ok(Some(OwnedFd::from_raw_fd(fd)));
+                let bytes = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
+                for i in 0..bytes / std::mem::size_of::<libc::c_int>() {
+                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::other("descriptor message truncated"));
+        }
+        let Some(fd) = fds.into_iter().next() else {
+            return Ok(None);
+        };
+        // macOS has no MSG_CMSG_CLOEXEC: without this, every program
+        // started while the disk is open (diskutil, caffeinate) inherits a
+        // writable descriptor to it.
+        if libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(fd))
     }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -96,6 +112,12 @@ mod tests {
         let p = std::env::temp_dir().join(format!("flasher_authopen_{}", std::process::id()));
         std::fs::write(&p, b"before").unwrap();
         let mut f = super::open_rw(p.to_str().unwrap()).unwrap();
+        // Programs started later must not inherit it.
+        let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&f), libc::F_GETFD) };
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "descriptor is inherited by children"
+        );
         f.seek(SeekFrom::Start(0)).unwrap();
         f.write_all(b"AFTER!").unwrap();
         drop(f);

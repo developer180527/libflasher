@@ -177,6 +177,11 @@ pub fn volume_label(label: &str) -> std::result::Result<String, String> {
     if l.is_empty() {
         return Err("give the drive a name".into());
     }
+    // Command-line tools take it as an argument; `diskutil eraseDisk` reads
+    // one starting with `-` as an option.
+    if l.starts_with('-') {
+        return Err("a drive name cannot start with -".into());
+    }
     if l.chars().count() > 11 {
         return Err("a drive name can be at most 11 characters".into());
     }
@@ -204,5 +209,28 @@ pub fn human_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_labels() {
+        assert_eq!(volume_label("  USB DRIVE ").as_deref(), Ok("USB DRIVE"));
+        assert_eq!(volume_label("my-stick_2").as_deref(), Ok("my-stick_2"));
+        for bad in [
+            "",
+            "   ",
+            "-rf",
+            "- x",
+            "TWELVE_CHARS",
+            "a\"b",
+            "a/b",
+            "ünï",
+        ] {
+            assert!(volume_label(bad).is_err(), "{bad:?} accepted");
+        }
     }
 }

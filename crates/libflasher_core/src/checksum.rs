@@ -4,6 +4,15 @@
 //! what distributions publish. [`find_published`] picks it up from the files
 //! publishers put next to their images — `SHA256SUMS`, `<name>.sha256` — so
 //! the check can happen without anyone pasting anything.
+//!
+//! # What a match proves
+//!
+//! A checksum file that came from the same place as the image proves the
+//! download is *intact*: nothing was lost or damaged on the way. It does not
+//! prove the image is *authentic*. Whoever could replace the image could
+//! replace the file beside it too. Only a hash taken from the publisher's
+//! own website, or a signature checked against the publisher's key, guards
+//! against that. Say which one was checked, as [`Published::kind`] allows.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -109,6 +118,19 @@ pub struct Published {
     pub sha256: String,
     /// The file it came from, for telling the user.
     pub source: String,
+    /// What kind of file that was.
+    pub kind: SumFile,
+}
+
+/// The kinds of checksum file publishers put beside images. Either way it
+/// came from beside the image: see the module docs on what a match proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SumFile {
+    /// Named after the image: `<image>.sha256`.
+    PerFile,
+    /// A list naming many files: `SHA256SUMS`.
+    List,
 }
 
 /// Look next to `image` for a published SHA-256 of it.
@@ -138,6 +160,11 @@ pub fn find_published(image: &Path) -> Option<Published> {
             return Some(Published {
                 sha256,
                 source: candidate,
+                kind: if per_file {
+                    SumFile::PerFile
+                } else {
+                    SumFile::List
+                },
             });
         }
     }
@@ -233,9 +260,13 @@ mod tests {
             found,
             Published {
                 sha256: hello.into(),
-                source: "SHA256SUMS".into()
+                source: "SHA256SUMS".into(),
+                kind: SumFile::List,
             }
         );
+
+        fs::write(dir.join("pi.img.sha256"), hello).unwrap();
+        assert_eq!(find_published(&img).unwrap().kind, SumFile::PerFile);
 
         let info = crate::image::inspect(&img).unwrap();
         let no = AtomicBool::new(false);

@@ -66,7 +66,9 @@ pub enum ImageKind {
     /// files copied onto it.
     PlainIso,
     /// No partition table and no ISO header. May still be valid (a bare
-    /// filesystem image); written byte for byte, with a warning.
+    /// filesystem image, some firmware images), so it is written byte for
+    /// byte when asked; but it may as well be a file that is no disk image
+    /// at all. Front ends should say so before erasing a drive for it.
     Unknown,
 }
 

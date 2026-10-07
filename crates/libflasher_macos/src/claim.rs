@@ -53,6 +53,8 @@ const UNMOUNT_FORCE: u32 = 0x0008_0000;
 const EXCLUSIVE_ACCESS: DAReturn = 0xF8DA_0004_u32 as i32;
 /// How long diskarbitrationd has to take the session in.
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A volume still mounted this long after an unmount request is asked again.
+const REUNMOUNT_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[link(name = "DiskArbitration", kind = "framework")]
 extern "C" {
@@ -244,10 +246,26 @@ impl Claim {
                         Err("macOS did not report the drive; it may have been unplugged".into())
                     });
                     let whole = ours.whole.to_str().unwrap_or_default().to_string();
+                    // When each volume was last asked to unmount. The request
+                    // is asynchronous: repeating it every pass only queues
+                    // duplicates in DiskArbitration, which can delay the one
+                    // that matters, so it is repeated only if the volume is
+                    // still mounted a while later.
+                    let mut asked: std::collections::HashMap<String, std::time::Instant> =
+                        std::collections::HashMap::new();
                     while ready && !flag.load(Ordering::Relaxed) {
                         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, 0);
-                        for volume in mounted_volumes(&whole) {
+                        let mounted = mounted_volumes(&whole);
+                        asked.retain(|v, _| mounted.contains(v));
+                        for volume in mounted {
                             ours.remounted.store(true, Ordering::Relaxed);
+                            if asked
+                                .get(&volume)
+                                .is_some_and(|t| t.elapsed() < REUNMOUNT_AFTER)
+                            {
+                                continue;
+                            }
+                            asked.insert(volume.clone(), std::time::Instant::now());
                             let Ok(name) = CString::new(volume) else {
                                 continue;
                             };
@@ -409,14 +427,24 @@ mod tests {
             // even when the refusal held. The mount table is the truth.
             let _ = mount();
             assert!(claim.refused() > 0, "the refusal was never asked");
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // The write already failed the moment the mount was seen; this
+            // bounds how long the volume stays mounted after that. CI's
+            // macOS 26 runner once took over 5 s, so the bound is generous
+            // and the time is printed.
+            let started = std::time::Instant::now();
+            let end = started + std::time::Duration::from_secs(15);
             while mounted_at(&whole) && std::time::Instant::now() < end {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            let took = started.elapsed();
             let version = command_text("sw_vers", &["-productVersion"]);
             assert!(
                 !mounted_at(&whole),
-                "still mounted 5 s after a mount while held (macOS {version}, refusal {refuse})"
+                "still mounted 15 s after a mount while held (macOS {version}, refusal {refuse})"
+            );
+            eprintln!(
+                "macOS {version}, refusal {refuse}: unmounted after {:.1} s",
+                took.as_secs_f32()
             );
             if !refuse {
                 // The mount went through, so it must have been noticed.

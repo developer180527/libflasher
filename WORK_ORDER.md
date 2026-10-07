@@ -453,10 +453,27 @@ that true and adds a test that keeps it true.
   workflow built the packages. A race in one headless test, found by the
   weekly run against libflasher `main`, was fixed in Flasher `b47ab0f`.
   **Open: step 5, the hardware checklist below** — no CI can stand in for it.
+- **Hardware results so far** (macOS 27.0.1, Apple silicon, Flasher `f840cd9`
+  and later; October 2026):
+  - Raw writes verified: a Raspberry Pi image and an Ubuntu 26.04 ISO.
+  - Windows 10 22H2 ISO extracted (906 files, 6.1 GB, `install.wim` in two
+    `.swm` parts) and verified. On an MSI desktop it booted as
+    "UEFI: … Partition 1" into Windows Setup, which listed all editions
+    (Home … Pro N), so Setup read the split set. Not installed further.
+  - Found on the way, and fixed: on macOS 26+ an exFAT/FAT volume mounted by
+    FSKit holds the disk, so opening it after the password prompt failed
+    with EBUSY ("permission denied"). The backend now authorizes, then
+    unmounts and claims, then opens through `authopen -extauth`
+    (libflasher `105c185`; CI's macOS disk is now a mounted exFAT image).
+  - Found on the way, and fixed: the window redrew at the display rate while
+    a job ran and never let wgpu reclaim finished frames, so graphics memory
+    grew by about 600 MB/s (29 GB in 90 s) and the whole Mac stalled. It now
+    polls the device every frame and redraws at 10 fps during jobs; a full
+    6.5 GB flash then held 80–260 MB (Flasher, after `f840cd9`).
 - **Hardware checklist** (before announcing):
   - **macOS (27 and, if at hand, 26)**:
     - Flash a Raspberry Pi `.img.xz`, then a `.zip` of an image.
-    - Extract a Windows ISO.
+    - ~~Extract a Windows ISO.~~ Done: boots into Setup, editions listed.
     - Mid-write, click the stick's volume in Disk Utility → Mount: it must
       be refused.
     - Cancel the password prompt once: the volumes stay mounted.

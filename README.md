@@ -107,8 +107,12 @@ panic. A mutation test holds this: 120,000 seeded, damaged images per run.
 | Independent tools | Apple's `hdiutil` builds Joliet, UDF and bridge ISOs; libflasher extracts them; **macOS mounts the result** and every file is compared. **wimlib** verifies and applies our `.swm` split sets. Info-ZIP `zip` and macOS `ditto` make the zips read back. | macOS tests; CI `wim-split` |
 | **Boot** | A GRUB UEFI ISO (built by `xorriso`, and by `genisoimage` with UDF) is extracted, then **booted in QEMU on OVMF** | CI `extract-boots` |
 
-Real hardware so far: a Raspberry Pi image and an Ubuntu ISO written and
-verified to a USB-C stick on macOS. Nothing else has touched a physical drive.
+Real hardware so far, all written from macOS 27 to a USB stick and verified:
+a Raspberry Pi image, an Ubuntu ISO, and a Windows 10 22H2 ISO in extract mode
+(906 files, `install.wim` split into two `.swm` parts). That Windows stick
+booted an MSI desktop in UEFI mode into Windows Setup, which listed every
+edition, so it read the split set (October 2026; not installed past that).
+Nothing has been written from Linux or Windows yet.
 
 ## State
 
@@ -116,9 +120,11 @@ Done: everything above. About 11,100 lines; 115 tests and 10 CI jobs.
 
 **Known gaps**, most important first:
 
-- **Real-hardware testing** on Linux and Windows, and of extract mode anywhere.
-- **Windows Setup from split `.swm` files**: the split is verified by wimlib,
-  not yet by installing Windows from it.
+- **Real-hardware testing** on Linux and Windows.
+- **A full Windows install from split `.swm` files**: Setup boots from an
+  extracted stick and lists the editions from the split set (on real UEFI
+  hardware), and wimlib verifies and applies the set; an install has not yet
+  been carried through to the desktop.
 - **Legacy BIOS boot, and files over 4 GB other than `install.wim`**: refused
   today. Both need GPL components (Syslinux/GRUB; NTFS + UEFI:NTFS), which
   will ship as a separate, optional package so libflasher stays MIT.

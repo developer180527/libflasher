@@ -71,10 +71,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p libflasher_macos --features test-virtual-disks --no-run
-      - name: attach a 256 MiB disk image without mounting it
+      - name: attach a 256 MiB disk image with a mounted exFAT volume
+        # Like a stick out of the packet: on macOS 26 and later its exFAT
+        # driver holds the disk, so it must be unmounted before it is opened.
         run: |
-          hdiutil create -size 256m -layout NONE -type UDIF "$RUNNER_TEMP/disk"
-          dev=$(hdiutil attach -nomount "$RUNNER_TEMP/disk.dmg" | head -1 | awk '{print $1}')
+          hdiutil create -size 256m -fs ExFAT -volname FLASHTEST -layout GPTSPUD -type UDIF "$RUNNER_TEMP/disk"
+          dev=$(hdiutil attach "$RUNNER_TEMP/disk.dmg" | head -1 | awk '{print $1}')
+          mount | grep FLASHTEST
           echo "FLASHER_TEST_DISK=$dev" >> "$GITHUB_ENV"
       - name: conformance (as root, so no authopen prompt is needed)
         run: |

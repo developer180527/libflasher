@@ -50,21 +50,52 @@ impl Platform for MacOs {
         let size = integer(&info, "TotalSize").unwrap_or(0);
         let sector = integer(&info, "DeviceBlockSize").unwrap_or(512) as u32;
 
-        // The password prompt first: if the user cancels it, their volumes
-        // stay mounted. The raw node bypasses the buffer cache: several times
-        // faster than /dev/diskN.
+        // The raw node bypasses the buffer cache: several times faster than
+        // /dev/diskN.
         let raw = format!("/dev/r{id}");
-        let file = if unsafe { libc::geteuid() } == 0 {
-            File::options().read(true).write(true).open(&raw)?
+        // The password prompt first: if the user cancels it, their volumes
+        // stay mounted.
+        let auth = if unsafe { libc::geteuid() } == 0 {
+            None
         } else {
-            authopen::open_rw(&raw)?
+            let name = if device.model.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", device.model)
+            };
+            Some(authopen::authorize(
+                &raw,
+                &format!(
+                    "Allow writing a disk image to {}{name}? Everything on that drive will be erased.",
+                    device.path
+                ),
+            )?)
         };
+        // Then unmount, before opening: a disk with a mounted volume cannot
+        // be opened for writing (macOS 26's exFAT and FAT drivers hold it).
         run("diskutil", &["unmountDisk", &device.path])?;
         // Held until the disk is closed: nothing mounts it again meanwhile.
         let claim = claim::Claim::take(id).map_err(|reason| Error::Refused {
             device: device.path.clone(),
             reason,
         })?;
+        let opened = match &auth {
+            None => File::options()
+                .read(true)
+                .write(true)
+                .open(&raw)
+                .map_err(Error::from),
+            Some(auth) => authopen::open_rw(&raw, auth),
+        };
+        let file = match opened {
+            Ok(f) => f,
+            Err(e) => {
+                // Nothing was written: give the user their volumes back.
+                drop(claim);
+                let _ = run("diskutil", &["mountDisk", &device.path]);
+                return Err(e);
+            }
+        };
         Ok(Box::new(Disk {
             file,
             size,

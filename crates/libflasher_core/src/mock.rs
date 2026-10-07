@@ -15,6 +15,7 @@
 //!
 //! Restoring writes `MOCKFS <label>` at the start of the drive, and keeping
 //! the computer awake creates `.awake` in the directory, so tests can see both.
+//! A `<name>.serial` file beside a drive gives it that serial number.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -62,13 +63,19 @@ impl Platform for MockPlatform {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                out.push(DeviceInfo {
-                    size: fs::metadata(&path)?.len(),
-                    model: format!("Mock {stem}"),
-                    bus: "Mock".into(),
-                    mountpoints: Vec::new(),
-                    path: path.display().to_string(),
-                });
+                // A serial, if `<name>.serial` sits beside the drive file:
+                // lets a test swap in an identical-looking drive.
+                let serial = fs::read_to_string(path.with_extension("serial")).ok();
+                out.push(
+                    DeviceInfo::new(
+                        path.display().to_string(),
+                        format!("Mock {stem}"),
+                        fs::metadata(&path)?.len(),
+                        "Mock",
+                        Vec::new(),
+                    )
+                    .with_serial(serial),
+                );
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));

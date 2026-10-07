@@ -122,6 +122,25 @@ pub(crate) fn dev_number_in(sys: &Path, name: &str) -> Option<(u32, u32)> {
     parse_dev(&read(&sys.join("block").join(name).join("dev")))
 }
 
+/// The drive's serial number: the first `serial` attribute found walking
+/// up from its device — the card itself for SD/MMC, the USB device a few
+/// levels up for a stick. `None` if nothing reports one.
+pub(crate) fn serial_in(sys: &Path, name: &str) -> Option<String> {
+    let root = fs::canonicalize(sys).ok()?;
+    let mut dir = fs::canonicalize(sys.join("block").join(name).join("device")).ok()?;
+    for _ in 0..10 {
+        if !dir.starts_with(&root) || dir == root {
+            return None;
+        }
+        let serial = read(&dir.join("serial"));
+        if !serial.is_empty() {
+            return Some(serial);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
 fn read(p: &Path) -> String {
     fs::read_to_string(p)
         .map(|s| s.trim().to_string())
@@ -299,5 +318,45 @@ mod tests {
         s.disk("pci/usb1/1-1", "sdb", &[("dev", "8:16")]);
         assert_eq!(dev_number_in(&s.0, "sdb"), Some((8, 16)));
         assert_eq!(dev_number_in(&s.0, "sdz"), None);
+    }
+
+    #[test]
+    fn finds_the_usb_serial_a_few_levels_up() {
+        let sys = FakeSys::new("serial_usb");
+        let d = sys.disk(
+            "usb1/1-1/1-1:1.0/host0/target0/0:0:0:0/block",
+            "sdb",
+            &[("device/model", "Ultra")],
+        );
+        fs::write(
+            sys.0.join("devices/usb1/1-1/serial"),
+            "4C530001231114117413\n",
+        )
+        .unwrap();
+        assert_eq!(
+            serial_in(&sys.0, "sdb").as_deref(),
+            Some("4C530001231114117413")
+        );
+        let _ = d;
+    }
+
+    #[test]
+    fn finds_an_sd_cards_own_serial() {
+        let sys = FakeSys::new("serial_sd");
+        sys.disk(
+            "mmc_host/mmc1/mmc1:aaaa/block",
+            "mmcblk1",
+            &[("device/serial", "0x1234abcd"), ("device/type", "SD")],
+        );
+        assert_eq!(serial_in(&sys.0, "mmcblk1").as_deref(), Some("0x1234abcd"));
+    }
+
+    #[test]
+    fn no_serial_and_never_above_sysfs() {
+        let sys = FakeSys::new("serial_none");
+        sys.disk("usb1/1-1/host0", "sdc", &[("device/model", "X")]);
+        // A `serial` file outside the fake sysfs must not be picked up.
+        assert_eq!(serial_in(&sys.0, "sdc"), None);
+        assert_eq!(serial_in(&sys.0, "nope"), None);
     }
 }

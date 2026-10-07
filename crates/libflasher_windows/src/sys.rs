@@ -58,22 +58,30 @@ impl Platform for Windows {
             let Ok(handle) = open_for_query(&policy::disk_path(n)) else {
                 continue;
             };
-            let Some((facts, model)) = describe(&handle, n, &system) else {
+            let Some(Described {
+                facts,
+                model,
+                serial,
+            }) = describe(&handle, n, &system)
+            else {
                 continue;
             };
             if !(policy::is_candidate(&facts) || is_test_disk(&facts)) {
                 continue;
             }
-            out.push(DeviceInfo::new(
-                policy::disk_path(n),
-                model,
-                facts.size,
-                policy::bus_name(facts.bus_type),
-                letters_on(n)
-                    .into_iter()
-                    .map(|l| format!("{l}:\\"))
-                    .collect(),
-            ));
+            out.push(
+                DeviceInfo::new(
+                    policy::disk_path(n),
+                    model,
+                    facts.size,
+                    policy::bus_name(facts.bus_type),
+                    letters_on(n)
+                        .into_iter()
+                        .map(|l| format!("{l}:\\"))
+                        .collect(),
+                )
+                .with_serial(serial),
+            );
         }
         Ok(out)
     }
@@ -180,7 +188,7 @@ fn checked(device: &DeviceInfo) -> Result<(u32, DiskFacts)> {
     };
     let n = policy::disk_number(&device.path).ok_or_else(|| refuse("not a physical drive path"))?;
     let handle = open_for_query(&device.path)?;
-    let (facts, _) = describe(&handle, n, &system_disks()?)
+    let Described { facts, .. } = describe(&handle, n, &system_disks()?)
         .ok_or_else(|| refuse("could not read the drive's details"))?;
     if !(policy::is_candidate(&facts) || is_test_disk(&facts)) {
         return Err(refuse(
@@ -212,7 +220,15 @@ fn open_for_query(path: &str) -> Result<File> {
         .open(path)?)
 }
 
-fn describe(disk: &File, number: u32, system: &[u32]) -> Option<(DiskFacts, String)> {
+/// What one physical disk says about itself.
+struct Described {
+    facts: DiskFacts,
+    model: String,
+    /// The storage descriptor's serial number, if the driver reports one.
+    serial: Option<String>,
+}
+
+fn describe(disk: &File, number: u32, system: &[u32]) -> Option<Described> {
     let query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageDeviceProperty,
         QueryType: PropertyStandardQuery,
@@ -250,10 +266,11 @@ fn describe(disk: &File, number: u32, system: &[u32]) -> Option<(DiskFacts, Stri
         size,
         is_system: system.contains(&number),
     };
-    Some((
+    Some(Described {
         facts,
-        policy::model(&text(desc.VendorIdOffset), &text(desc.ProductIdOffset)),
-    ))
+        model: policy::model(&text(desc.VendorIdOffset), &text(desc.ProductIdOffset)),
+        serial: Some(text(desc.SerialNumberOffset)),
+    })
 }
 
 fn geometry(disk: &File) -> Option<DISK_GEOMETRY_EX> {

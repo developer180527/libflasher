@@ -59,7 +59,8 @@ impl Platform for Linux {
             } else {
                 "USB"
             };
-            out.push(DeviceInfo::new(dev, model, size, bus, mountpoints));
+            let serial = disk::serial_in(Path::new(SYS), &name);
+            out.push(DeviceInfo::new(dev, model, size, bus, mountpoints).with_serial(serial));
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)

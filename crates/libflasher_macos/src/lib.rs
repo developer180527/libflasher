@@ -17,6 +17,7 @@ use plist::{Dictionary, Value};
 
 mod authopen;
 mod claim;
+mod serial;
 mod watch;
 
 pub struct MacOs;
@@ -33,7 +34,15 @@ impl Platform for MacOs {
         let list = with_test_disk(list)?;
         // A Mac started from an external drive lists it as external.
         let system = system_disks()?;
-        Ok(devices_in(&list, &system, disk_info))
+        let devices = devices_in(&list, &system, disk_info);
+        // The I/O Registry, not diskutil, knows the serial number.
+        Ok(devices
+            .into_iter()
+            .map(|d| {
+                let serial = d.path.strip_prefix("/dev/").and_then(serial::of);
+                d.with_serial(serial)
+            })
+            .collect())
     }
 
     fn open_device(&self, device: &DeviceInfo) -> Result<Box<dyn RawDevice>> {

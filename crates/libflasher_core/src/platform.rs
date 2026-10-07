@@ -22,6 +22,10 @@ pub struct DeviceInfo {
     pub bus: String,
     /// Mounted volumes on this disk. They are unmounted before writing.
     pub mountpoints: Vec<String>,
+    /// The drive's serial number, where the OS reports one. Used only to
+    /// tell two drives of the same model and size apart; cheap sticks often
+    /// have none, or share one.
+    pub serial: Option<String>,
 }
 
 impl DeviceInfo {
@@ -39,16 +43,35 @@ impl DeviceInfo {
             size,
             bus: bus.into(),
             mountpoints,
+            serial: None,
         }
     }
 
-    /// Whether two listings describe the same physical disk. Mounts are left
-    /// out: they change while a disk stays put, and are unmounted anyway.
+    /// Set the serial number. Blank or all-zero serials, which some drives
+    /// report, are treated as none.
+    pub fn with_serial(mut self, serial: Option<String>) -> Self {
+        self.serial = serial
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.chars().all(|c| c == '0' || c == ' '));
+        self
+    }
+
+    /// Whether two listings describe the same physical disk: same path,
+    /// model, size and bus, and the same serial when both have one. Mounts
+    /// are left out: they change while a disk stays put, and are unmounted
+    /// anyway.
     pub fn same_disk(&self, other: &DeviceInfo) -> bool {
+        let serials_agree = match (&self.serial, &other.serial) {
+            (Some(a), Some(b)) => a == b,
+            // Known on one side only (the OS could not read it once): not
+            // evidence of a different drive.
+            _ => true,
+        };
         self.path == other.path
             && self.model == other.model
             && self.size == other.size
             && self.bus == other.bus
+            && serials_agree
     }
 
     /// Short enough for a picker: `SanDisk Ultra · 28.7 GB USB`. The path is
@@ -214,6 +237,29 @@ pub fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn serials_tell_identical_models_apart() {
+        let stick = |serial: Option<&str>| {
+            DeviceInfo::new("/dev/disk4", "SanDisk Ultra", 32 << 30, "USB", vec![])
+                .with_serial(serial.map(Into::into))
+        };
+        assert!(stick(Some("AA01")).same_disk(&stick(Some("AA01"))));
+        assert!(
+            !stick(Some("AA01")).same_disk(&stick(Some("BB02"))),
+            "same model, different stick"
+        );
+        assert!(
+            stick(Some("AA01")).same_disk(&stick(None)),
+            "serial unread once is not a different drive"
+        );
+        assert!(stick(None).same_disk(&stick(None)));
+        // Placeholder serials say nothing.
+        assert_eq!(stick(Some("000000000000")).serial, None);
+        assert_eq!(stick(Some("  ")).serial, None);
+        assert_eq!(stick(Some(" 4C53 ")).serial.as_deref(), Some("4C53"));
+    }
+
     use super::*;
 
     #[test]

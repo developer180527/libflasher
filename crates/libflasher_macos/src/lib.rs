@@ -568,6 +568,96 @@ mod tests {
         }
     }
 
+    /// Extract mode through the real backend, onto the disk image named in
+    /// `FLASHER_TEST_DISK`, from the ISO in `FLASHER_TEST_ISO` (any size: the
+    /// disk image is a sparse file). Meanwhile a probe times, once a second,
+    /// what every app leans on: `diskutil list` and reading `/Volumes`. Prints
+    /// the slow ones, so a write that stalls the rest of the Mac shows up
+    /// without a USB stick that might be the cause instead.
+    #[test]
+    #[ignore = "writes to the disk named in FLASHER_TEST_DISK"]
+    #[cfg(feature = "test-virtual-disks")]
+    fn extract_an_iso_while_timing_the_system() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let (Some(path), Ok(iso)) = (
+            libflasher_core::conformance::test_disk(),
+            std::env::var("FLASHER_TEST_ISO"),
+        ) else {
+            return;
+        };
+        let drive = MacOs
+            .list_devices()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.path == path)
+            .expect("the test disk is listed");
+        let image = libflasher_core::image::inspect(&iso).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worst = Arc::new(Mutex::new(Vec::<(f32, String)>::new()));
+        let started = Instant::now();
+        let probe = {
+            let (stop, worst) = (stop.clone(), worst.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    let _ = Command::new("diskutil").arg("list").output();
+                    let list = t.elapsed();
+                    let t = Instant::now();
+                    let _ = std::fs::read_dir("/Volumes").map(|d| d.count());
+                    let vols = t.elapsed();
+                    let at = started.elapsed().as_secs_f32();
+                    for (what, took) in [("diskutil list", list), ("read /Volumes", vols)] {
+                        if took > Duration::from_millis(1500) {
+                            let line =
+                                format!("{at:6.1} s: {what} took {:.1} s", took.as_secs_f32());
+                            eprintln!("SLOW {line}");
+                            worst.lock().unwrap().push((took.as_secs_f32(), line));
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            })
+        };
+
+        let mut dev = MacOs.open_listed(&drive).unwrap();
+        let mut last = Instant::now();
+        let mut phase = String::new();
+        let result = libflasher_core::write_image(
+            &image,
+            dev.as_mut(),
+            &libflasher_core::FlashOptions::default(),
+            &AtomicBool::new(false),
+            &mut |p| {
+                let name = format!("{p:?}");
+                let name = name.split([' ', '{', '(']).next().unwrap_or("").to_string();
+                if name != phase || last.elapsed() > Duration::from_secs(5) {
+                    eprintln!("{:6.1} s: {p:?}", started.elapsed().as_secs_f32());
+                    phase = name;
+                    last = Instant::now();
+                }
+            },
+        );
+        drop(dev);
+        stop.store(true, Ordering::Relaxed);
+        probe.join().unwrap();
+        let slow = worst.lock().unwrap().clone();
+        eprintln!(
+            "done in {:.0} s: {:?}; {} slow probes",
+            started.elapsed().as_secs_f32(),
+            result.as_ref().map(|n| format!("{n} bytes")),
+            slow.len()
+        );
+        result.unwrap();
+        assert!(
+            slow.is_empty(),
+            "the system stalled while writing: {slow:?}"
+        );
+    }
+
     /// Attaching a disk image is a plug-in as far as DiskArbitration is
     /// concerned, and needs no root: this runs everywhere, CI included.
     #[test]

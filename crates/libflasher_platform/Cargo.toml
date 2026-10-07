@@ -12,10 +12,10 @@ description = "Picks the Platform implementation for the OS being built for."
 libflasher_core.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libflasher_macos = { path = "../libflasher_macos", version = "0.1.0" }
+libflasher_macos = { path = "../libflasher_macos", version = "0.1.1" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libflasher_linux = { path = "../libflasher_linux", version = "0.1.0" }
+libflasher_linux = { path = "../libflasher_linux", version = "0.1.1" }
 
 [target.'cfg(windows)'.dependencies]
-libflasher_windows = { path = "../libflasher_windows", version = "0.1.0" }
+libflasher_windows = { path = "../libflasher_windows", version = "0.1.1" }
